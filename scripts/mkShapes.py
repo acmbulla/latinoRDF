@@ -301,7 +301,7 @@ std::vector<std::string> getBranchNames(TTree* tree) {{
     #                                                              "file_path" is a list of root files!
     def create_cpp_source_list_of_files(self, output_name, tree_name, file_path, output_root_file_name, sampleName, weight,
                                         aliases_to_be_defined, functions_to_be_defined,
-                                        subsamples):
+                                        subsamples, aliases_ordered=None):
 
         # This is your C++ template as a Python string
 
@@ -383,61 +383,100 @@ std::vector<std::string> getBranchNames(TTree* tree) {{
 
 
         #
-        # define the aliases needed for this specific sample
         #
-        define_aliases = ""
-        define_aliases += f"//  aliases/define needed\n"
-
-        for aliasName, alias in aliases_to_be_defined.items():
-          define_aliases += f'    varied_df = SafeDefine(varied_df, "{aliasName}", "{alias}");\n'
-
-
-        #
-        # define the aliases and functions needed for this specific sample
+        # define the aliases and functions in the SAME ORDER as aliases.py
+        # so that expr aliases depending on function results are defined after them
         #
         code_of_function_to_include = ""
+        _included_external_files = set()  # track already-included files to avoid redefinitions
 
-        define_aliases_functions = ""
-        define_aliases_functions += f"//  aliases of functions\n"
+        lines_to_add     = ""   # extra #include / gSystem->Load() before main()
+        lines_to_process = ""   # class instantiations inside main() before dataframe
+        lines_to_global  = ""   # global scope declarations after external code, before main()
+        _included_lines_to_add = set()  # avoid duplicates
+        _included_lines_to_global = set()  # avoid duplicates
 
-        # not SafeDefine since these are new variables ... make it so!
-        for aliasName, alias in functions_to_be_defined.items():
-          if 'external' in alias.keys():
-            with open(alias["external"], "r") as file: # this is the file with the c++ code to be included
-              code_of_function_to_include += file.read()
-          code_of_function_to_include += "\n"
+        define_aliases = ""
+        define_aliases += f"//  aliases and functions (in aliases.py order)\n"
 
-          define_aliases_functions += "    varied_df = varied_df"
+        define_aliases_functions = ""  # kept for backwards compat but will be empty
 
-          if 'xmlfile' not in alias.keys(): # if "xmlfile" is present, it's a TMVA and it requires casting to float
-            for i, var in enumerate(alias["variables"]):
-              define_aliases_functions += f'\n                     .Define("_var_{aliasName}_{i}", "{var}")'
-          else:  # if "xmlfile" is present, it's a TMVA and it requires casting to float
-            for i, var in enumerate(alias["variables"]):
-              define_aliases_functions += f'\n                     .Define("_var_{aliasName}_{i}_f", "(float){var}")'
+        _aliases_ordered = aliases_ordered if aliases_ordered is not None else {}
+        # fallback: if no ordered dict, process expr first then functions (old behaviour)
+        if not _aliases_ordered:
+            for aliasName, expr in aliases_to_be_defined.items():
+                _aliases_ordered[aliasName] = ('expr', expr)
+            for aliasName, alias in functions_to_be_defined.items():
+                _aliases_ordered[aliasName] = ('function', alias)
 
-          define_aliases_functions += ";\n"
+        for aliasName, (kind, payload) in _aliases_ordered.items():
+            if kind == 'expr':
+                # Replace single quotes with \" so strings inside the JIT expr
+                # are correctly delimited in the generated C++ string literal.
+                # Users can write 'M' in their expr instead of worrying about escaping.
+                _payload = payload.replace("'", '\\"')
+                define_aliases += f'    varied_df = SafeDefine(varied_df, "{aliasName}", "{_payload}");\n'
+            else:
+                alias = payload
 
-          # if a simple c++ function
-          if 'xmlfile' not in alias.keys():
-            define_aliases_functions += f'\n'
-            new_names = [f"_var_{aliasName}_{i}" for i in range(len(alias["variables"]))]
-            sintax_variables = '{ "' + '", "'.join(new_names) + '" }'
-            define_aliases_functions += f'    varied_df = varied_df.Define("{aliasName}", {alias["function"]}, {sintax_variables} );\n'
-            define_aliases_functions += f'\n'
-          # if "xmlfile" is present, it's a TMVA
-          elif 'xmlfile' in alias.keys():
-            define_aliases_functions += f'\n'
-            submission_dir = os.getcwd()
-            define_aliases_functions += f'''    TMVA::Experimental::RReader my_model_{aliasName}("{submission_dir}/{alias['xmlfile']}");\n'''
+                # --- linesToAdd: #include or gSystem->Load() before main() ---
+                if 'linesToAdd' in alias.keys():
+                    for line in alias['linesToAdd']:
+                        if line not in _included_lines_to_add:
+                            lines_to_add += line + "\n"
+                            _included_lines_to_add.add(line)
 
-            new_names = [f"_var_{aliasName}_{i}_f" for i in range(len(alias["variables"]))]
-            sintax_variables = '{ "' + '", "'.join(new_names) + '" }'
+                # --- linesToProcess: class instantiation inside main() ---
+                if 'linesToProcess' in alias.keys():
+                    for line in alias['linesToProcess']:
+                        lines_to_process += "    " + line + "\n"
 
-            define_aliases_functions += f'''    varied_df = varied_df.Define("{aliasName}",
+                # --- linesToGlobal: global scope after external code, before main() ---
+                if 'linesToGlobal' in alias.keys():
+                    for line in alias['linesToGlobal']:
+                        if line not in _included_lines_to_global:
+                            lines_to_global += line + "\n"
+                            _included_lines_to_global.add(line)
+
+                # --- external: include code before continue ---
+                if 'external' in alias.keys():
+                    if alias["external"] not in _included_external_files:
+                        with open(alias["external"], "r") as file:
+                            code_of_function_to_include += file.read()
+                        code_of_function_to_include += "\n" 
+                        _included_external_files.add(alias["external"])
+
+                # --- expr: use directly as Define string (no variables loop) ---
+                if ('linesToAdd' in alias.keys() or 'linesToGlobal' in alias.keys()) and 'expr' in alias.keys():
+                    _expr = alias['expr'].replace("'", '\\"')
+                    define_aliases += f'    varied_df = SafeDefine(varied_df, "{aliasName}", "{_expr}");\n'
+                    continue
+
+                define_aliases += "    varied_df = varied_df"
+                if 'xmlfile' not in alias.keys():
+                    for i, var in enumerate(alias["variables"]):
+                        define_aliases += f'\n                     .Define("_var_{aliasName}_{i}", "{var}")'
+                else:
+                    for i, var in enumerate(alias["variables"]):
+                        define_aliases += f'\n                     .Define("_var_{aliasName}_{i}_f", "(float){var}")'
+                define_aliases += ";\n"
+
+                if 'xmlfile' not in alias.keys():
+                    define_aliases += f'\n'
+                    new_names = [f"_var_{aliasName}_{i}" for i in range(len(alias["variables"]))]
+                    sintax_variables = '{ "' + '", "'.join(new_names) + '" }'
+                    define_aliases += f'    varied_df = varied_df.Define("{aliasName}", {alias["function"]}, {sintax_variables} );\n'
+                    define_aliases += f'\n'
+                else:
+                    define_aliases += f'\n'
+                    submission_dir = os.getcwd()
+                    define_aliases += f'''    TMVA::Experimental::RReader my_model_{aliasName}("{submission_dir}/{alias['xmlfile']}");\n'''
+                    new_names = [f"_var_{aliasName}_{i}_f" for i in range(len(alias["variables"]))]
+                    sintax_variables = '{ "' + '", "'.join(new_names) + '" }'
+                    define_aliases += f'''    varied_df = varied_df.Define("{aliasName}",
                      TMVA::Experimental::Compute<{len(alias['variables'])}, float>(my_model_{aliasName}),
                      {sintax_variables});\n'''
-            define_aliases_functions += f'\n'
+                    define_aliases += f'\n'
 
 
         #
@@ -527,8 +566,10 @@ std::vector<std::string> getBranchNames(TTree* tree) {{
               # If it does not exist, skip. But ... how is it possible you have the varied value but not the nominal one? How did you produce the varied variable?
               #
               register_variations_logic_for_alternative_trees += f'''        if (std::find(nominalBranches.begin(), nominalBranches.end(), nomCol) != nominalBranches.end()) {{\n'''
-              register_variations_logic_for_alternative_trees += f'''          std::string expression = "ROOT::RVec<" + varied_df.GetColumnType(nomCol) + ">{{static_cast<" + varied_df.GetColumnType(nomCol) + ">(" + branch + ")}}";\n'''
-              #
+              register_variations_logic_for_alternative_trees += f'''          std::string col_type = varied_df.GetColumnType(nomCol);\n'''
+              register_variations_logic_for_alternative_trees += f'''          std::string expression = (col_type.find("RVec") != std::string::npos)\n'''
+              register_variations_logic_for_alternative_trees += f'''            ? ("ROOT::RVec<" + col_type + ">{{" + branch + "}}")\n'''
+              register_variations_logic_for_alternative_trees += f'''            : ("ROOT::RVec<" + col_type + ">{{static_cast<" + col_type + ">(" + branch + ")}}");\n'''
               # why do I have long float vs float between the nominal and the varied variable?
               # FIXME: some fix might be needed in the post-processing step --> removing the (technically not-needed) casting might make this code faster
               #
@@ -548,7 +589,10 @@ std::vector<std::string> getBranchNames(TTree* tree) {{
               register_variations_logic_for_alternative_trees += f'''      if (int(branch.size()) >= (suffix_size-1) && branch.compare(branch.size() - (suffix_size-1), (suffix_size-1), "{nuisance['mapDown']}") == 0 ) {{\n'''
               register_variations_logic_for_alternative_trees += f'''        std::string nomCol = branch.substr(0, branch.size() - suffix_size);\n'''
               register_variations_logic_for_alternative_trees += f'''        if (std::find(nominalBranches.begin(), nominalBranches.end(), nomCol) != nominalBranches.end()) {{\n'''
-              register_variations_logic_for_alternative_trees += f'''          std::string expression = "ROOT::RVec<" + varied_df.GetColumnType(nomCol) + ">{{static_cast<" + varied_df.GetColumnType(nomCol) + ">(" + branch + ")}}";\n'''
+              register_variations_logic_for_alternative_trees += f'''          std::string col_type = varied_df.GetColumnType(nomCol);\n'''
+              register_variations_logic_for_alternative_trees += f'''          std::string expression = (col_type.find("RVec") != std::string::npos)\n'''
+              register_variations_logic_for_alternative_trees += f'''            ? ("ROOT::RVec<" + col_type + ">{{" + branch + "}}")\n'''
+              register_variations_logic_for_alternative_trees += f'''            : ("ROOT::RVec<" + col_type + ">{{static_cast<" + col_type + ">(" + branch + ")}}");\n'''
               register_variations_logic_for_alternative_trees += f'''          varied_df = varied_df.Vary(\n'''
               register_variations_logic_for_alternative_trees += f'''                                    nomCol,\n'''
               register_variations_logic_for_alternative_trees += f'''                                    expression,\n'''
@@ -736,15 +780,6 @@ std::vector<std::string> getBranchNames(TTree* tree) {{
 
 
 
-        # # Write C++ code to create a specific node for this sub_name
-        # cpp_file.write(f'auto df_{sub_name} = df_base.Filter("{sub_cut}");\n')
-        #
-        # # If the subsample has a specific weight:
-        # sub_weight = subsample_weights.get(sub_name, "1.0")
-        # cpp_file.write(f'auto df_{sub_name}_final = df_{sub_name}.Define("total_weight", "{sub_weight}");\n')
-
-
-
             for variableName, variable in self._variables.items():
                 #  Different options for range definition:
                 #
@@ -837,20 +872,6 @@ std::vector<std::string> getBranchNames(TTree* tree) {{
 
 
 
-                # # We add each RResultPtr to a vector called 'histograms'
-                # define_variables_logic += f'    hist_map_1D["{this_cutName}"].push_back(node_{this_cutName}.{histo_call});\n'
-                # define_variables_logic += f'    hist_map["{this_cutName}"].push_back(node_{this_cutName}.{histo_call});\n'
-                # define_variables_logic += f'    hist_map["{this_cutName}"].push_back(ROOT::RDF::RResultPtr<TH1D> (node_{this_cutName}.{histo_call}) );\n'
-
-                # We add each RResultPtr to a vector called 'histograms'
-                # define_variables_logic += f'    hist_map["{this_cutName}"].push_back(node_{this_cutName}.Histo1D({{"h_{variableName}", "{variableName}", {model_str}}}, "{variableName}", "my_sample_weight"));\n'
-
-
-###                 (bins, v_min, v_max) = variable['range']
-###                 # We add each RResultPtr to a vector called 'histograms'
-###                 define_variables_logic += f'    hist_map["{this_cutName}"].push_back(node_{this_cutName}.Histo1D({{"h_{variableName}", "{variableName}", {bins}, {v_min}, {v_max}}}, "{variableName}", "my_sample_weight"));\n'
-
-
         define_variables_logic += f'    \n'
         define_variables_logic += f'    std::vector<std::string> list_of_variables_1D;\n'
         define_variables_logic += f'    std::vector<std::string> list_of_variables_2D;\n'
@@ -872,9 +893,6 @@ std::vector<std::string> getBranchNames(TTree* tree) {{
               define_variables_logic += f'    list_of_variables_fold_1D.push_back({variable["fold"]});\n'
             else :
               define_variables_logic += f'    list_of_variables_fold_1D.push_back(0);\n'
-
-
-
 
 
         cpp_code = f"""
@@ -904,13 +922,23 @@ std::vector<std::string> getBranchNames(TTree* tree) {{
 #include "TMVA/RInferenceUtils.hxx"
 
 
+// --- Automatically generated: linesToAdd (includes and library loads) ---
+
+{lines_to_add}
+
+// ----------------------------------------
+
 // --- Automatically generated: code to be added for additional functions ---
 
 {code_of_function_to_include}
 
 // ----------------------------------------
 
+// --- Automatically generated: global scope declarations ---
 
+{lines_to_global}
+
+// ----------------------------------------
 
 // --- Automatically generated: code to be added for special nuisances ---
 
@@ -920,11 +948,20 @@ std::vector<std::string> getBranchNames(TTree* tree) {{
 
 
 int main() {{
-    ROOT::EnableImplicitMT();
+    ROOT::DisableImplicitMT();
+    std::cout << "   [DEBUG] ImplicitMT disabled" << std::endl;
+
+    // --- Automatically generated: linesToProcess (class instantiations) ---
+
+    {lines_to_process}
+    std::cout << "   [DEBUG] linesToProcess done" << std::endl;
+
+    // ----------------------------------------
 
     // --- Automatically generated input root files ---
 
     {define_input_files_logic}
+    std::cout << "   [DEBUG] TChain created" << std::endl;
 
     // ----------------------------------------
 
@@ -932,9 +969,6 @@ int main() {{
     std::map<std::string, std::vector<ROOT::RDF::RResultPtr<TH2D>>> hist_map_2D;
 
     // --- Automatically generated register nuisances variations for alternative trees ---
-    //        Alternative trees variation nuisances to be defined at the beginning because they might change the
-    //        variables that are defined downstream, e.g. njet, BDT(ptjet, ptlepton, ...)
-    //
 
     {register_variations_logic_for_alternative_trees}
 
@@ -946,21 +980,25 @@ int main() {{
 
     // ----------------------------------------
 
-    // --- Automatically generated define aliases ---
+    // --- Automatically generated define aliases for functions, no JIT ---
+    // (must come before expr aliases that depend on them, e.g. WZ_vars before mll_Z)
 
-    {define_aliases}
+    {define_aliases_functions}
+    std::cout << "   [DEBUG] define_aliases_functions done" << std::endl;
 
     // ----------------------------------------
 
-    // --- Automatically generated define aliases for functions, no JIT ---
+    // --- Automatically generated define aliases ---
 
-    {define_aliases_functions}
+    {define_aliases}
+    std::cout << "   [DEBUG] define_aliases done" << std::endl;
 
     // ----------------------------------------
 
     // --- Automatically generated define weights ---
 
     {define_weights}
+    std::cout << "   [DEBUG] define_weights done" << std::endl;
 
     // ----------------------------------------
 
@@ -968,12 +1006,14 @@ int main() {{
     // --- Automatically generated register nuisances variations ---
 
     {register_variations_logic}
+    std::cout << "   [DEBUG] register_variations done" << std::endl;
 
     // ----------------------------------------
 
     // --- Automatically generated ... just the main node ---
 
     {booking_logic}
+    std::cout << "   [DEBUG] booking done" << std::endl;
 
     //
     // from now on: current_node
@@ -982,6 +1022,7 @@ int main() {{
     // --- Automatically generated define cuts and histograms ---
 
     {define_variables_logic}
+    std::cout << "   [DEBUG] define_variables done" << std::endl;
 
     // ----------------------------------------
 
@@ -1018,11 +1059,13 @@ int main() {{
     if (!hist_map_1D.empty()) {{
       ROOT::RDF::RunGraphs(all_booking_1D);
     }}
+    std::cout << "   [DEBUG] RunGraphs 1D done" << std::endl;
 
     std::cout << "   ROOT::RDF::RunGraphs 2D" << std::endl;
     if (!hist_map_2D.empty()) {{
       ROOT::RDF::RunGraphs(all_booking_2D);
     }}
+    std::cout << "   [DEBUG] RunGraphs 2D done" << std::endl;
 
 
     std::cout << "   Done, now save in the final root file" << std::endl;
@@ -1090,10 +1133,6 @@ int main() {{
             temp_name = name.c_str();
             // scale_e_2018_UL:up --> scale_e_2018_ULup
             temp_name.erase(std::remove(temp_name.begin(), temp_name.end(), ':'), temp_name.end());
-            //size_t pos = temp_name.find(':');
-            //if (pos != std::string::npos) {{
-            //  temp_name = temp_name.substr(0, pos);
-            //}}
             if (sub_name == "") temp_name = ("histo_{sampleName}_" + temp_name);
             else                temp_name = ("histo_{sampleName}_" + sub_name + "_" + temp_name);
           }}
@@ -1102,9 +1141,6 @@ int main() {{
 
           if (list_of_variables_fold_1D.at(ivar) != 0) FoldHistogram(histo.get(), list_of_variables_fold_1D.at(ivar));
 
-          //
-          // special treatment for nuisances based on averaged histograms
-          //
           bool found_any_nuisances_for_averaged_histograms = false;
           for (auto const& [string_pattern, nuisance_name_numVariations] : map_nuisances_name_for_averaged_histograms) {{
 
@@ -1122,7 +1158,7 @@ int main() {{
               std::string histo_temp_name = std::regex_replace(temp_name, pattern_to_remove, "");
               std::regex pattern(string_pattern);
 
-              histo_temp_name = std::regex_replace(histo_temp_name, pattern, nuisance_name); // replace with real nuisance name
+              histo_temp_name = std::regex_replace(histo_temp_name, pattern, nuisance_name);
 
               histo->SetName(histo_temp_name.c_str());
 
@@ -1133,7 +1169,7 @@ int main() {{
                 else {{
                   map_nuisances_average_histogram[nuisance_name + "up"] = (*histo);
                   found_any_nuisances_for_averaged_histograms = true;
-                  break; // end loop over map to save time
+                  break;
                 }}
               }}
               else {{
@@ -1143,32 +1179,28 @@ int main() {{
                 else {{
                   map_nuisances_average_histogram[nuisance_name + "do"] = (*histo);
                   found_any_nuisances_for_averaged_histograms = true;
-                  break; // end loop over map to save time
+                  break;
                 }}
               }}
             }}
           }}
-          // if it's NOT a histogram to be averaged, then write it directly
           if (not found_any_nuisances_for_averaged_histograms) {{
             histo->Write();
           }}
 
-          // now write all the averaged histograms, up and down variations, if there are any!
           for (auto const& [name, temp_histo] : map_nuisances_average_histogram) {{
             temp_histo.Write();
           }}
 
-
         }}
       }}
-      out_file.cd(); // Go back to root for the next directory
+      out_file.cd();
     }}
 
     big_loop = 0;
     for (auto& [cut_label, h_list] : hist_map_2D) {{
 
       std::string current_cut = cut_label;
-      // check if subsamples case: this_cutName___sampleName_sub_name
       std::string sub_name = "";
       std::string delimiter = "___";
       size_t pos_triple = cut_label.find(delimiter);
@@ -1181,22 +1213,18 @@ int main() {{
         current_cut = this_cutName;
       }}
 
-      // Create a folder for this cut
       TDirectory *dir = out_file.GetDirectory(current_cut.c_str());
       if (!dir) {{
-        // If it doesn't exist, create it
         dir = out_file.mkdir(current_cut.c_str());
       }}
       for (size_t ivar = 0; ivar < h_list.size(); ivar++) {{
         dir->cd();
         TDirectory *subdir = out_file.GetDirectory( (current_cut+"/"+list_of_variables_2D.at(ivar)).c_str() );
         if (!subdir) {{
-          // If it doesn't exist, create it
           subdir = out_file.mkdir( (current_cut+"/"+list_of_variables_2D.at(ivar)).c_str() );
         }}
         subdir->cd();
 
-        // get the nominal and the variations too
         auto all_histos = results_2D_variations.at(big_loop);
         big_loop++;
 
@@ -1210,29 +1238,17 @@ int main() {{
           }}
           else {{
             temp_name = name.c_str();
-            // scale_e_2018_UL:up --> scale_e_2018_ULup
             temp_name.erase(std::remove(temp_name.begin(), temp_name.end(), ':'), temp_name.end());
-            //size_t pos = temp_name.find(':');
-            //if (pos != std::string::npos) {{
-            //  temp_name = temp_name.substr(0, pos);
-            //}}
             if (sub_name == "") temp_name = ("histo_{sampleName}_" + temp_name);
             else                temp_name = ("histo_{sampleName}_" + sub_name + "_" + temp_name);
           }}
           gDirectory = subdir;
           histo->SetName(temp_name.c_str());
 
-
           if (list_of_variables_fold_2D.at(ivar) != 0) FoldHistogram(histo.get(), list_of_variables_fold_2D.at(ivar));
-
-          //UnrollHistogram(dynamic_cast<TH2D*>(histo.get()))->Write();
 
           auto new_histo = UnrollHistogram(dynamic_cast<TH2D*>(histo.get()));
 
-
-          //
-          // special treatment for nuisances based on averaged histograms
-          //
           bool found_any_nuisances_for_averaged_histograms = false;
           for (auto const& [string_pattern, nuisance_name_numVariations] : map_nuisances_name_for_averaged_histograms) {{
 
@@ -1250,7 +1266,7 @@ int main() {{
               std::string histo_temp_name = std::regex_replace(temp_name, pattern_to_remove, "");
               std::regex pattern(string_pattern);
 
-              histo_temp_name = std::regex_replace(histo_temp_name, pattern, nuisance_name); // replace with real nuisance name
+              histo_temp_name = std::regex_replace(histo_temp_name, pattern, nuisance_name);
 
               new_histo->SetName(histo_temp_name.c_str());
 
@@ -1261,7 +1277,7 @@ int main() {{
                 else {{
                   map_nuisances_average_histogram[nuisance_name + "up"] = (*new_histo);
                   found_any_nuisances_for_averaged_histograms = true;
-                  break; // end loop over map to save time
+                  break;
                 }}
               }}
               else {{
@@ -1271,25 +1287,22 @@ int main() {{
                 else {{
                   map_nuisances_average_histogram[nuisance_name + "do"] = (*new_histo);
                   found_any_nuisances_for_averaged_histograms = true;
-                  break; // end loop over map to save time
+                  break;
                 }}
               }}
             }}
           }}
-          // if it's NOT a histogram to be averaged, then write it directly
           if (not found_any_nuisances_for_averaged_histograms) {{
             new_histo->Write();
           }}
 
-          // now write all the averaged histograms, up and down variations, if there are any!
           for (auto const& [name, temp_histo] : map_nuisances_average_histogram) {{
             temp_histo.Write();
           }}
 
-
         }}
       }}
-      out_file.cd(); // Go back to root for the next directory
+      out_file.cd();
     }}
 
 
@@ -1304,23 +1317,14 @@ int main() {{
 
         with open(f"{output_name}.cpp", "w") as f:
             f.write(cpp_code)
-        # print(f"Created {output_name}.cpp")
-
-
 
 
     # _____________________________________________________________________________
     def compile_cpp(self, source_name):
-        # Get ROOT flags automatically using 'root-config'
         root_flags = subprocess.check_output(["root-config", "--cflags", "--libs"]).decode().strip()
-
-        # Construct the compilation command
         compile_cmd = f"g++ -O2 {source_name}.cpp -o {source_name} {root_flags}"
-        # compile_cmd = f"g++ -O3 {source_name}.cpp -o {source_name} {root_flags}"
-
         print(f"Compiling...")
         result = os.system(compile_cmd)
-
         if result == 0:
             print(f"Compilation successful: ./{source_name}")
         else:
@@ -1329,75 +1333,44 @@ int main() {{
 
     # _____________________________________________________________________________
     def generate_makefile(self, file_paths, dictionary_of_files_divided_by_sample, makefile_name="Makefile"):
-        # Get ROOT configuration via shell calls
         cpp_flags = "$(shell root-config --cflags)"
-        # ld_flags = "$(shell root-config --libs) -lTMVA -lXMLIO"  # why TMVA is not by default?!?
-        # ld_flags = f"$(shell root-config --libs) -lTMVA -lXMLIO -Wl,-rpath,'$$ORIGIN:$$ORIGIN{self._scripts_run_folder}/'"
-
-        # ld_flags = f"$(shell root-config --libs) -lTMVA -lXMLIO -I/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/include -L/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/lib -lcorrectionlib -Wl,-rpath,'$$ORIGIN:$$ORIGIN{self._scripts_run_folder}/'"
-
-        # $ORIGIN is where the executable is
-        # the libraries are in ../../
-        # NB: FIXME it might be useful to move them into a "lib" folder later ... for cleaner setup, but not mandatory
-        #
         ld_flags = f"$(shell root-config --libs) -lTMVA -lXMLIO -I/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/include -L/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/lib -lcorrectionlib -Wl,-rpath,'$$ORIGIN:$$ORIGIN/../../'"
 
-        # ld_flags = f"$(shell root-config --libs) -lTMVA -lXMLIO -I/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/include -L/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/lib -lcorrectionlib -Wl,-rpath,'$$ORIGIN:$$ORIGIN{self._scripts_run_folder}/'"
-
-        # -I/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/include -L/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/lib -lcorrectionlib
-
-
-        # ld_flags = f"$(shell root-config --libs) -lTMVA -lXMLIO -I/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/include -L/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/lib -lcorrectionlib -Wl,-rpath,'$$ORIGIN:$$ORIGIN{self._scripts_run_folder}/'"
-
-        # ld_flags = f"$(shell root-config --libs) -lTMVA -lXMLIO -I/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/include -L/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/lib -lcorrectionlib -Wl,-rpath,'$$ORIGIN:$$ORIGIN{self._scripts_run_folder}/'"
-
-
-
         type_of_compilation = "-O2"
-        # from "blabla.cpp" to "blabla"
         targets = [os.path.splitext(f)[0] for f in file_paths]
-
 
         with open(makefile_name, "w") as f:
             f.write("# Generated Makefile\n")
             f.write("CXX = g++\n")
-            # f.write(f"CXXFLAGS = {type_of_compilation} -Wall {cpp_flags} -std=c++20 -Wcpp \n")  # c++20 used for "ends_with"
-            # f.write(f"CXXFLAGS = {type_of_compilation} -Wall {cpp_flags} \n")
             f.write(f"CXXFLAGS = {type_of_compilation} -Wall -fPIC {cpp_flags} -I{self._scripts_run_folder}/ \n")
             f.write(f"LDFLAGS = {ld_flags}\n\n")
 
             f.write(f"LIB_NAME = liblibrary_utils.so\n\n")
 
-
-            # 'all' target: the list of all executables to be created
             all_targets = " ".join(targets)
             f.write(f"all: $(LIB_NAME) {all_targets}\n\n")
 
-
-            # from "blabla.cpp" to "blabla"
             for sample_key in dictionary_of_files_divided_by_sample.keys():
               target_sample = [os.path.splitext(f)[0] for f in dictionary_of_files_divided_by_sample[sample_key]]
               all_target_sample = " ".join(target_sample)
               f.write(f"{sample_key}: $(LIB_NAME) {all_target_sample}\n\n")
 
-
             f.write(f"$(LIB_NAME): {self._scripts_run_folder}/library_utils.cpp {self._scripts_run_folder}/library_utils.h\n")
             f.write(f"\t$(CXX) $(CXXFLAGS) -shared -o {self._scripts_run_folder}/$@ {self._scripts_run_folder}/library_utils.cpp\n")
 
-            # The Pattern Rule
-            # This says: To create ANY executable 'X', look for 'X.cpp'
-            # It works across subdirectories automatically.
             f.write("%: %.cpp $(LIB_NAME)\n")
-            # f.write("\t$(CXX) $(CXXFLAGS) $< -o $@ -L. -llibrary_utils $(LDFLAGS)\n\n")
             f.write(f"\t$(CXX) $(CXXFLAGS) $< -o $@ -L{self._scripts_run_folder}/ -llibrary_utils $(LDFLAGS)\n\n")
 
-            # Clean target
             f.write("clean:\n")
             f.write(f"\trm -f $(LIB_NAME) {all_targets}\n")
 
 
     # _____________________________________________________________________________
-    def setValues(self, outputDir, variables, cuts, supercut, samples, nuisances, aliases, lumi):
+    def setValues(self, outputDir, variables, cuts, supercut, samples, nuisances, aliases, lumi,
+                  scripts_run_folder=None, script_batch_location=None, extra_transfer_files=None):
+        """Set analysis values. Optionally override folder locations for generated
+        C++ sources (scripts_run_folder) and batch submission scripts
+        (script_batch_location). If not provided, the instance defaults are kept."""
 
         self._variables = variables
         self._samples   = samples
@@ -1408,11 +1381,41 @@ int main() {{
         self._outputDir = outputDir
         self._lumi      = lumi
 
+        # Override folder locations only when explicitly provided.
+        # os.path.expandvars handles ${MY_PATH_JOBS} and $MY_PATH_JOBS style
+        # environment variables so users can set paths in configuration.py
+        # using env-var placeholders (e.g. "${MY_PATH_JOBS}/2024/scripts_run").
+        if scripts_run_folder is not None:
+            self._scripts_run_folder = os.path.expandvars(scripts_run_folder)
+        if script_batch_location is not None:
+            self._script_batch_location = os.path.expandvars(script_batch_location)
+        if extra_transfer_files is not None:
+            self._extra_transfer_files = [os.path.expandvars(f) for f in extra_transfer_files]
+
+        # Also expand env vars in outputDir for consistency
+        self._outputDir = os.path.expandvars(outputDir)
+
     # _____________________________________________________________________________
     def setConditions(self, silentMode):
 
         self._silentMode = silentMode
 
+
+    # _____________________________________________________________________________
+    @staticmethod
+    def _normalize_sample_name(name_field):
+        """Accept both dict {'subname': [files]} and list of tuples [(subname, [files])]."""
+        if isinstance(name_field, dict):
+            return name_field
+        # list of tuples: [(subname, [files]), ...]
+        result = {}
+        for item in name_field:
+            subname, files = item
+            if subname in result:
+                result[subname].extend(files)
+            else:
+                result[subname] = list(files)
+        return result
 
     # _____________________________________________________________________________
     def makeNominals(self):
@@ -1421,93 +1424,64 @@ int main() {{
         print ("==== makeNominals ====")
         print ("======================")
 
-        os.system ("mkdir " + self._outputDir + "/")
+        os.makedirs(self._outputDir, exist_ok=True)
 
         ROOT.TH1.SetDefaultSumw2(True)
 
-        os.system ("mkdir " + self._scripts_run_folder + "/")
+        os.makedirs(self._scripts_run_folder, exist_ok=True)
 
-        #
-        # create the header and cpp code for the library with useful functions
-        #
         self.create_library_cpp()
 
         list_of_files_to_compile = []
         list_of_files_to_compile_divided_by_sample = {}
 
-        # print ("length of samples = ", len(self._samples))
-        #
-        # Loop over samples
-        #
         for sampleName, sample in self._samples.items():
-          os.system ("mkdir " + self._scripts_run_folder + "/" + sampleName + "/")
-          #
-          # create an executable for each file in each sample
-          #
-          # samples is a dictionary: {'subname' : [list of root files] }
-          #
-          # print ("length of sample['name'] = ", len(sample['name']))
+          os.makedirs(self._scripts_run_folder + "/" + sampleName, exist_ok=True)
 
           list_of_files_to_compile_divided_by_sample[sampleName] = []
 
           global_weight = sample['weight'] if 'weight' in sample.keys() else "1."
 
-          # weight per "sub-dataset"
           weights_subname = sample['weights'] if 'weights' in sample.keys() else {}
 
-
-          #
-          # check if "isData". If NOT isData then multiply by lumi otherwise no
-          #
           if 'isData' in sample.keys() :
             if not (len(sample ['isData']) == 1 and sample ['isData'][0] == 'all') :
-              # if you put 'all', all the root files are considered "data"
-              # ok, it's data ... and so now?
-              #
               pass
-          else : # default is "scale to luminosity"
+          else :
             global_weight = f"({global_weight}) * {self._lumi}"
 
-
-          #
-          # check if additional "Define" is needed, from "alises"
-          #
           aliases_to_be_defined = {}
           functions_to_be_defined = {}
+          # aliases_ordered preserves the original order from aliases.py
+          # so that expr aliases depending on function aliases are defined after them
+          aliases_ordered = {}
           for aliasName, alias in self._aliases.items():
-            if 'samples' in alias.keys():
-              if sampleName in alias['samples'] and 'expr' in alias.keys():
+            # if 'samples' is not specified, apply to all samples (default ALL)
+            if 'samples' not in alias.keys() or sampleName in alias['samples']:
+              if 'expr' in alias.keys() and 'linesToAdd' not in alias.keys():
                 aliases_to_be_defined[aliasName] = alias['expr']
-              if sampleName in alias['samples'] and 'function' in alias.keys():
-                functions_to_be_defined[aliasName] = alias
+                aliases_ordered[aliasName] = ('expr', alias['expr'])
+              if 'function' in alias.keys() or 'linesToAdd' in alias.keys() or 'linesToGlobal' in alias.keys():
+                  functions_to_be_defined[aliasName] = alias
+                  aliases_ordered[aliasName] = ('function', alias)
 
 
-          for subname, list_root_files in sample['name'].items():
+          for subname, list_root_files in self._normalize_sample_name(sample['name']).items():
             print ("length of list_root_files = ", len(list_root_files))
-            os.system ("mkdir " + self._scripts_run_folder + "/" + sampleName + "/" + subname + "/")
+            os.makedirs(self._scripts_run_folder + "/" + sampleName + "/" + subname, exist_ok=True)
 
-            # if weights per subname are listed, use them
-            # e.g. per PD weights in data
-            #
             if subname in weights_subname.keys():
               weight = f"({global_weight}) * ({weights_subname[subname]})"
             else :
               weight = global_weight
 
-            #
-            # Merge together different root files in one single job, not to have billions of jobs :)
-            #
             make_job_every_N = 1
             if "FilesPerJob" in sample.keys():
               make_job_every_N = sample['FilesPerJob']
-            #
-            # create a list of lists of root files, one per job to be submitted
-            # [ [root1, root2, root3], [root4, root5]]
-            #
+
             chunks_list_root_files = [list_root_files[i:i + make_job_every_N] for i in range(0, len(list_root_files), make_job_every_N)]
 
             for i, root_files in enumerate(chunks_list_root_files):
-              # name_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/" + "my_run_analysis_" + str(i)
               name_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/" + "my_run_analysis_" + sampleName + "_" + subname + "_" + str(i)
               tree = "Events"
 
@@ -1518,42 +1492,17 @@ int main() {{
                 subsamples_dict = sample['subsamples']
               self.create_cpp_source_list_of_files(name_code, tree, root_files, output_root_file_name, sampleName, weight,
                                                    aliases_to_be_defined, functions_to_be_defined,
-                                                   subsamples_dict)
+                                                   subsamples_dict, aliases_ordered)
 
               list_of_files_to_compile.append(name_code)
               list_of_files_to_compile_divided_by_sample[sampleName].append(name_code)
 
-              # self.compile_cpp(name_code)
-
-
-            # for i, root_file in enumerate(list_root_files):
-            #   # name_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/" + "my_run_analysis_" + str(i)
-            #   name_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/" + "my_run_analysis_" + sampleName + "_" + subname + "_" + str(i)
-            #   tree = "Events"
-            #
-            #   output_root_file_name = "root_file___" + sampleName + "_" + subname + "_" + str(i) + ".root"
-            #
-            #   self.create_cpp_source_single_file(name_code, tree, root_file, output_root_file_name, sampleName, weight, aliases_to_be_defined)
-            #
-            #   list_of_files_to_compile.append(name_code)
-            #   # self.compile_cpp(name_code)
-
 
         self.generate_makefile(list_of_files_to_compile, list_of_files_to_compile_divided_by_sample)
 
-        # Run the compilation in parallel
-        # print("Start parallel compilation...")
         print("Do not compile ... If you want to compile run the compilation by hand!")
 
         subprocess.run(["make", "clean"])
-        # subprocess.run(["make", "-j4"])
-        # subprocess.run(["make", "-j8"])
-        #
-        # subprocess.run() is a blocking call -> it will make the compilation to end before the next step
-        #
-
-        # Now you can run it:
-        # subprocess.run([f"./{name_code}"])
 
 
     # _____________________________________________________________________________
@@ -1568,45 +1517,64 @@ int main() {{
 
         list_jobs_with_error = []
         list_missing_root_files = []
-        #
-        # Loop over samples
-        #
+        list_running_jobs = []
+
+        stats = {}
+
         for sampleName, sample in self._samples.items():
-          for subname, list_root_files in sample['name'].items():
+          stats[sampleName] = {'done': 0, 'running': 0, 'error': 0, 'missing': 0}
+          for subname, list_root_files in self._normalize_sample_name(sample['name']).items():
             make_job_every_N = 1
             if "FilesPerJob" in sample.keys():
               make_job_every_N = sample['FilesPerJob']
             chunks_list_root_files = [list_root_files[i:i + make_job_every_N] for i in range(0, len(list_root_files), make_job_every_N)]
             for i, root_files in enumerate(chunks_list_root_files):
               name_err_file = self._script_batch_location + "/" + sampleName + "/" + subname + "/log/" + "my_script_" + str(i) + ".sh.err"
-              if os.path.exists(name_err_file):
-                with open(name_err_file, 'r') as f:
-                  line_count = sum(1 for line in f)
-                  if line_count > 6: # should I remove the warnings to have 0? FIXME
-                    list_jobs_with_error.append(name_err_file)
+              name_log_file = self._script_batch_location + "/" + sampleName + "/" + subname + "/log/" + "my_script_" + str(i) + ".log"
               output_root_file_name = "root_file___" + sampleName + "_" + subname + "_" + str(i) + ".root"
               root_file_name = f"{submission_dir}/{self._outputDir}/{output_root_file_name}"
+
               if os.path.exists(root_file_name):
-                pass
-              else :
-                list_missing_root_files.append(root_file_name)
+                stats[sampleName]['done'] += 1
+              elif not os.path.exists(name_err_file):
+                if os.path.exists(name_log_file):
+                  with open(name_log_file, 'r') as f:
+                    content = f.read()
+                  if 'Job was aborted' in content:
+                    list_jobs_with_error.append(name_log_file)
+                    stats[sampleName]['error'] += 1
+                  elif 'Job was evicted' in content or 'Finished transferring output files' in content:
+                    list_missing_root_files.append(root_file_name)
+                    stats[sampleName]['missing'] += 1
+                  else:
+                    list_running_jobs.append(root_file_name)
+                    stats[sampleName]['running'] += 1
+                else:
+                  list_running_jobs.append(root_file_name)
+                  stats[sampleName]['running'] += 1
+              else:
+                with open(name_err_file, 'r') as f:
+                  lines = f.readlines()
+                if len(lines) > 6:
+                  list_jobs_with_error.append(name_err_file)
+                  stats[sampleName]['error'] += 1
+                else:
+                  list_missing_root_files.append(root_file_name)
+                  stats[sampleName]['missing'] += 1
 
-
-        if len(list_jobs_with_error) == 0:
-          print (" No jobs with error ")
-        else :
-          print(" Jobs with errors:")
-          for index, job in enumerate(list_jobs_with_error):
-            print(f"    Job {index}: {job}")
-
-
-        if len(list_missing_root_files) == 0:
-          print (" All files are ready ")
-        else :
-          print(" Missing files:")
-          for index, job in enumerate(list_missing_root_files):
-            print(f"     File: {index}: {job}")
-
+        # print tabella
+        col_w = max(len(s) for s in stats.keys()) + 2
+        print(f"{'Sample':<{col_w}} {'Done':>8} {'Pending':>8} {'Error':>8}")
+        print("-" * (col_w + 28))
+        total = {'done': 0, 'running': 0, 'error': 0, 'missing': 0}
+        for sampleName, s in stats.items():
+          pending = s['running'] + s['missing']
+          print(f"{sampleName:<{col_w}} {s['done']:>8} {pending:>8} {s['error']:>8}")
+          for k in total:
+            total[k] += s[k]
+        print("-" * (col_w + 28))
+        total_pending = total['running'] + total['missing']
+        print(f"{'TOTAL':<{col_w}} {total['done']:>8} {total_pending:>8} {total['error']:>8}")
 
 
     def parallelCompile(self):
@@ -1616,13 +1584,10 @@ int main() {{
         print ("==========================")
 
         where_compile = "parallel_compile"
-        os.system ("mkdir " + where_compile + "/")
+        os.makedirs(where_compile, exist_ok=True)
 
         submission_dir = os.getcwd()
 
-        #
-        # Loop over samples
-        #
         for sampleName, sample in self._samples.items():
           name_bash = where_compile + "/my_script_compile_" + sampleName + ".sh"
 
@@ -1670,91 +1635,235 @@ queue
         print ("==== submit Batch ====")
         print ("======================")
 
-        os.system ("mkdir " + self._script_batch_location + "/")
+        os.makedirs(self._script_batch_location, exist_ok=True)
 
         submission_dir = os.getcwd()
+        abs_library  = os.path.join(self._scripts_run_folder, "liblibrary_utils.so")
+        abs_lib_cpp  = os.path.join(self._scripts_run_folder, "library_utils.cpp")
+        abs_lib_h    = os.path.join(self._scripts_run_folder, "library_utils.h")
 
-        #
-        # Loop over samples
-        #
+        try:
+            root_cflags = subprocess.check_output(["root-config", "--cflags"]).decode().strip()
+            root_libs   = subprocess.check_output(["root-config", "--libs"]).decode().strip()
+        except Exception:
+            root_cflags = ""
+            root_libs   = ""
+
+        # Build liblibrary_utils.so locally if it does not exist yet.
+        # This is fast (~5s) and needed in compile-on-node mode so the .so
+        # can be transferred to the worker node.
+        if not os.path.exists(abs_library):
+            print("  -> liblibrary_utils.so not found, compiling it locally...")
+            compile_lib_cmd = (
+                f"g++ -O2 -Wall -fPIC {root_cflags} -shared "
+                f"-o {abs_library} {abs_lib_cpp} {root_libs}"
+            )
+            ret = os.system(compile_lib_cmd)
+            if ret == 0:
+                print(f"  -> liblibrary_utils.so compiled: {abs_library}")
+            else:
+                print("  -> ERROR: failed to compile liblibrary_utils.so")
+
+        # -------------------------------------------------------------------
+        # Detect mode once by checking the first expected executable.
+        # Either ALL are compiled or NONE are.
+        # -------------------------------------------------------------------
+        first_exe = None
         for sampleName, sample in self._samples.items():
-          os.system ("mkdir " + self._script_batch_location + "/" + sampleName + "/")
+          for subname, list_root_files in self._normalize_sample_name(sample['name']).items():
+            if list_root_files:
+              first_exe = os.path.join(self._scripts_run_folder, sampleName, subname,
+                                       "my_run_analysis_" + sampleName + "_" + subname + "_0")
+              break
+          if first_exe:
+            break
 
-          for subname, list_root_files in sample['name'].items():
-            os.system ("mkdir " + self._script_batch_location + "/" + sampleName + "/" + subname + "/")
+        precompiled = first_exe is not None and os.path.isfile(first_exe)
 
-            make_job_every_N = 1
-            if "FilesPerJob" in sample.keys():
-              make_job_every_N = sample['FilesPerJob']
-            chunks_list_root_files = [list_root_files[i:i + make_job_every_N] for i in range(0, len(list_root_files), make_job_every_N)]
+        if precompiled:
+            print("  -> Pre-compiled executables found: transferring binaries to worker nodes.")
+        else:
+            print("  -> No pre-compiled executables found: worker nodes will compile before running.")
+
+        # queue rows: (executable, job_exe, output, error, log)
+        # "executable" is the .sh script (set per-row in the queue)
+        # "job_exe"    is the binary or .cpp (set per-row, used in transfer_input_files via header)
+        # The fixed extra transfer files (library/.so or lib sources) go in the header.
+        # Detect the X509 proxy path at submission time so the worker node can use it
+        _proxy_candidates = [
+            os.environ.get('X509_USER_PROXY', ''),
+            os.path.expanduser('~/.proxy'),
+            f"/tmp/x509up_u{os.getuid()}",
+        ]
+        x509_proxy = next((p for p in _proxy_candidates if p and os.path.exists(p)), None)
+        if x509_proxy:
+            # Also check the proxy is actually valid (not expired)
+            proxy_check = subprocess.run(["voms-proxy-info", "--exists", "--valid", "1:00"],
+                                         capture_output=True)
+            if proxy_check.returncode != 0:
+                print(f"ERROR: proxy found at {x509_proxy} but it is expired or invalid.")
+                print("       Please run: voms-proxy-init --voms cms --valid 168:00")
+                print("       then rerun --submitBatch")
+                return
+            proxy_basename = os.path.basename(x509_proxy)
+            proxy_lines = f"export X509_USER_PROXY=$(pwd)/{proxy_basename}\nexport EOS_MGM_URL=root://eosuser.cern.ch\nvoms-proxy-info\n"
+            print(f"  -> X509 proxy found and valid: {x509_proxy}")
+        else:
+            print("ERROR: no X509 proxy found.")
+            print("       Please run: voms-proxy-init --voms cms --valid 168:00")
+            print("       then rerun --submitBatch")
+            return
+
+        queue_rows = []
+
+        for sampleName, sample in self._samples.items():
+          os.makedirs(os.path.join(self._script_batch_location, sampleName), exist_ok=True)
+
+          for subname, list_root_files in self._normalize_sample_name(sample['name']).items():
+            os.makedirs(os.path.join(self._script_batch_location, sampleName, subname), exist_ok=True)
+
+            make_job_every_N = sample.get('FilesPerJob', 1)
+            chunks_list_root_files = [list_root_files[i:i + make_job_every_N]
+                                      for i in range(0, len(list_root_files), make_job_every_N)]
 
             for i, root_files in enumerate(chunks_list_root_files):
-              name_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/" + "my_run_analysis_" + sampleName + "_" + subname + "_" + str(i)
-              name_code_no_folder = "my_run_analysis_" + sampleName + "_" + subname + "_" + str(i)
-              name_bash = self._script_batch_location + "/" + sampleName + "/" + subname + "/" + "my_script_" + str(i) + ".sh"
+              name_code_no_folder   = "my_run_analysis_" + sampleName + "_" + subname + "_" + str(i)
+              name_bash             = os.path.join(self._script_batch_location, sampleName, subname,
+                                                   "my_script_" + str(i) + ".sh")
               output_root_file_name = "root_file___" + sampleName + "_" + subname + "_" + str(i) + ".root"
+              name_folder      = os.path.join(self._script_batch_location, sampleName, subname)
+              name_folder_code = os.path.join(self._scripts_run_folder, sampleName, subname)
+              abs_executable   = os.path.join(name_folder_code, name_code_no_folder)
+              abs_cpp          = os.path.join(name_folder_code, name_code_no_folder + ".cpp")
 
-#
-# moving into a folder structure is needed to handle libraries properly
-#
+              # Build the copy command.
+              # If destination is on EOS, avoid hardcoding the /eos path in the script
+              # (HTCondor scans executable content and rejects /eos paths).
+              # Instead, build the destination at runtime inside the script using shell variables.
+              dest_dir = f"{submission_dir}/{self._outputDir}"
+              if submission_dir.startswith('/eos'):
+                # Normalize /eos/home-X/username to /eos/user/X/username
+                # which is the correct path for root://eosuser.cern.ch
+                import re as _re
+                dest_dir_normalized = _re.sub(
+                    r'^/eos/home-([a-z])/',
+                    lambda m: f"/eos/user/{m.group(1)}/",
+                    dest_dir
+                )
+                cp_cmd = f"xrdcp {self._outputDir}/{output_root_file_name} root://eosuser.cern.ch//{dest_dir_normalized}/{output_root_file_name}"
+              else:
+                cp_cmd = f"cp {self._outputDir}/{output_root_file_name}  {dest_dir}/"
 
-              bash_code = f"""#!/bin/bash
-set -e  # Exit on error
+              if precompiled:
+                bash_code = f"""#!/bin/bash
+set -e
 echo "Job started at $(date)"
 echo "Running on node $(hostname)"
-mkdir {self._outputDir}
-mkdir {sampleName}/
-mkdir {sampleName}/{subname}/
+source /cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh
+{proxy_lines}mkdir -p {self._outputDir}
+mkdir -p {sampleName}/{subname}/
 mv {name_code_no_folder} {sampleName}/{subname}/
 ./{sampleName}/{subname}/{name_code_no_folder}
-cp {self._outputDir}/{output_root_file_name}  {submission_dir}/{self._outputDir}/
-
-echo "Current directory content after running:"
+{cp_cmd}
+echo "Done at $(date)"
 ls -lh
-echo "Current full path: $(pwd)"
-
 """
+                job_exe = abs_executable
 
-              with open(f"{name_bash}", "w") as f:
+              else:
+                bash_code = f"""#!/bin/bash
+set -e
+echo "Job started at $(date)"
+echo "Running on node $(hostname)"
+source /cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh
+{proxy_lines}echo "Compiling analysis executable..."
+g++ -O2 -Wall -fPIC {root_cflags} -I. \\
+    {name_code_no_folder}.cpp -o {name_code_no_folder} \\
+    -L. -llibrary_utils \\
+    -lTMVA -lXMLIO \\
+    -I/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/include \\
+    -L/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/lib \\
+    -lcorrectionlib {root_libs} \\
+    -Wl,-rpath,'$ORIGIN'
+echo "Compilation done at $(date)"
+mkdir -p {self._outputDir}
+mkdir -p {sampleName}/{subname}/
+mv liblibrary_utils.so {sampleName}/{subname}/
+mv {name_code_no_folder} {sampleName}/{subname}/
+export LD_LIBRARY_PATH=$(pwd)/{sampleName}/{subname}/:$LD_LIBRARY_PATH
+./{sampleName}/{subname}/{name_code_no_folder}
+{cp_cmd}
+echo "Done at $(date)"
+ls -lh
+"""
+                job_exe = abs_cpp
+
+              with open(name_bash, "w") as f:
                 f.write(bash_code)
-                os.system ("chmod +x " + name_bash)
-                # print ("name_bash = ", name_bash)
+                os.system("chmod +x " + name_bash)
 
-              name_submit = submission_dir + "/" + self._script_batch_location + "/" + sampleName + "/" + subname + "/" + "my_script_" + str(i) + ".sub"
-              # name_folder = submission_dir + "/" + self._script_batch_location + "/" + sampleName + "/" + subname + "/"
-              name_folder = self._script_batch_location + "/" + sampleName + "/" + subname + "/"
-              name_folder_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/"
-              name_bash_no_folder = "my_script_" + str(i) + ".sh"
-
-              if self._silentMode :
+              if self._silentMode:
                 output_file = "/dev/null"
                 error_file  = "/dev/null"
                 log_file    = "/dev/null"
-              else :
-                output_file = f"log/{name_bash_no_folder}.out"
-                error_file  = f"log/{name_bash_no_folder}.err"
-                log_file    = f"log/{name_bash_no_folder}.log"
+              else:
+                log_dir = os.path.join(name_folder, "log")
+                os.makedirs(log_dir, exist_ok=True)
+                output_file = os.path.join(log_dir, f"my_script_{i}.out")
+                error_file  = os.path.join(log_dir, f"my_script_{i}.err")
+                log_file    = os.path.join(log_dir, f"my_script_{i}.log")
 
+              queue_rows.append((name_bash, job_exe, output_file, error_file, log_file))
 
-              submit_code = f"""
-initialdir            = {name_folder}
-executable            = {name_bash}
-transfer_input_files  = {submission_dir}/{name_folder_code}{name_code_no_folder}, {submission_dir}/{self._scripts_run_folder}/liblibrary_utils.so
-should_transfer_files   = YES
-when_to_transfer_output = ON_EXIT
-output                = {output_file}
-error                 = {error_file}
-log                   = {log_file}
-getenv                = True
-+JobFlavour           = "longlunch"
-queue
-"""
+        # ------------------------------------------------------------------
+        # Single .sub file using "queue executable, job_exe, output, error, log from (...)"
+        # From the HTCondor docs (queue var from (...) syntax), submit commands
+        # like "executable", "output", "error", "log" can be set as per-row variables.
+        # The fixed extra transfer files (same for all jobs) go in the header.
+        # This avoids any macro-expansion issues.
+        # ------------------------------------------------------------------
+        global_submit_path = os.path.join(self._script_batch_location, "submit_all.sub")
 
-              with open(f"{name_submit}", "w") as f:
-                f.write(submit_code)
+        # Extra files to transfer (e.g. btag efficiency maps, macros)
+        # Set via extra_transfer_files in configuration.py
+        extra_files = getattr(self, '_extra_transfer_files', [])
+        extra_files_str = (", " + ", ".join(extra_files)) if extra_files else ""
 
-              print("Submitting job to HTCondor: condor_submit " + name_submit)
-              subprocess.run(["condor_submit", f"{name_submit}"])
+        if precompiled:
+            fixed_extra = f"{abs_library}, {x509_proxy}{extra_files_str}"
+        else:
+            fixed_extra = f"{abs_lib_cpp}, {abs_lib_h}, {abs_library}, {x509_proxy}{extra_files_str}"
+
+        queue_lines = "\n".join(
+            f"  {exe}, {job_exe}, {out}, {err}, {log}"
+            for exe, job_exe, out, err, log in queue_rows
+        )
+
+        submit_code = (
+            "# Auto-generated by mkShapes.py\n"
+            f"# Mode: {'pre-compiled' if precompiled else 'compile-on-node'}\n"
+            "\n"
+            "should_transfer_files   = YES\n"
+            "when_to_transfer_output = ON_EXIT\n"
+            f"transfer_input_files    = $(job_exe), {fixed_extra}\n"
+            "getenv                  = True\n"
+            "+JobFlavour             = \"longlunch\"\n"
+            "\n"
+            "queue executable, job_exe, output, error, log from (\n"
+            + queue_lines + "\n"
+            ")\n"
+        )
+
+        with open(global_submit_path, "w") as f:
+            f.write(submit_code)
+
+        print(f"Created: {global_submit_path}  ({len(queue_rows)} jobs)")
+        print("Submitting all jobs with a single condor_submit ...")
+        # Run condor_submit from the directory containing the .sub file,
+        # so that HTCondor sees an AFS working directory regardless of where
+        # mkShapes.py was launched from.
+        subprocess.run(["condor_submit", global_submit_path],
+                       cwd=self._script_batch_location)
 
 #
 #
@@ -1810,25 +1919,6 @@ if __name__ == '__main__':
     print ("opt.checkBatch       = ", opt.checkBatch)
     print ("opt.silentMode       = ", opt.silentMode)
 
-
-
-
-    # not used by mkShapes
-    # print ("opt.structureFile    = ", opt.structureFile)
-
-    #
-    # logic of dependencies:
-    #
-    #    samples.py
-    #      --> nuisances.py   since some nuisances are defined only for some samples
-    #      --> aliases.py     since the aliases/defines will be "Defined" only for selected samples
-    #    cuts.py
-    #      --> nuisances.py   since some nuisances are defined only for some cuts (e.g. lnN of migration)
-    #    nuisances.py
-    #    variables.py
-    #
-
-
     #
     # read list of samples
     #
@@ -1837,10 +1927,7 @@ if __name__ == '__main__':
       handle = open(opt.samplesFile,'r')
       exec(handle.read())
       handle.close()
-      # clean the dictionary to remove globals due to "exec" funcionality
       samples = {k: v for k, v in samples.items() if not (k.startswith('__') and k.endswith('__'))}
-
-    # print ("samples = ", samples)
 
     #
     # read list of variables
@@ -1850,11 +1937,9 @@ if __name__ == '__main__':
       handle = open(opt.variablesFile,'r')
       exec(handle.read())
       handle.close()
-      # clean the dictionary to remove globals due to "exec" funcionality
       variables = {k: v for k, v in variables.items() if not (k.startswith('__') and k.endswith('__'))}
 
     print ("variables = ", variables)
-
 
     #
     # read list of cuts
@@ -1865,12 +1950,10 @@ if __name__ == '__main__':
       handle = open(opt.cutsFile,'r')
       exec(handle.read())
       handle.close()
-      # clean the dictionary to remove globals due to "exec" funcionality
       cuts = {k: v for k, v in cuts.items() if not (k.startswith('__') and k.endswith('__'))}
 
     print ("cuts = ", cuts)
     print ("supercut = ", supercut)
-
 
     #
     # read list of nuisances
@@ -1880,11 +1963,9 @@ if __name__ == '__main__':
       handle = open(opt.nuisancesFile,'r')
       exec(handle.read())
       handle.close()
-      # clean the dictionary to remove globals due to "exec" funcionality
       nuisances = {k: v for k, v in nuisances.items() if not (k.startswith('__') and k.endswith('__'))}
 
     print ("nuisances = ", nuisances)
-
 
     #
     # read list of aliases
@@ -1894,30 +1975,35 @@ if __name__ == '__main__':
       handle = open(opt.aliasesFile,'r')
       exec(handle.read())
       handle.close()
-      # clean the dictionary to remove globals due to "exec" funcionality
       aliases = {k: v for k, v in aliases.items() if not (k.startswith('__') and k.endswith('__'))}
 
     print ("aliases = ", aliases)
 
 
-
-
-
-
     factory = ShapeFactory()
-    factory.setValues( opt.outputDir, variables, cuts, supercut, samples, nuisances , aliases, opt.lumi)
-    factory.setConditions (opt.silentMode)
 
-    # factory._treeName  = opt.treeName
-    # factory._energy    = opt.energy
-    # factory._lumi      = opt.lumi
-    # factory._tag       = opt.tag
+    # -----------------------------------------------------------------------
+    # Read folder locations from configuration.py (via opt), falling back to
+    # the ShapeFactory defaults when not set there.
+    # -----------------------------------------------------------------------
+    scripts_run_folder    = getattr(opt, 'scripts_run_folder',    None)
+    script_batch_location = getattr(opt, 'script_batch_location', None)
+
+    factory.setValues(
+        opt.outputDir, variables, cuts, supercut, samples, nuisances, aliases, opt.lumi,
+        scripts_run_folder    = scripts_run_folder,
+        script_batch_location = script_batch_location,
+        extra_transfer_files  = getattr(opt, 'extra_transfer_files', None),
+    )
+    factory.setConditions(opt.silentMode)
+
+    print ("factory._scripts_run_folder    = ", factory._scripts_run_folder)
+    print ("factory._script_batch_location = ", factory._script_batch_location)
 
     if not opt.submitBatch and not opt.haddRootFiles and not opt.checkBatch and not opt.localCompile and not opt.parallelCompile:
       factory.makeNominals()
 
     if opt.localCompile :
-      # no need to call the factory, just compile
       subprocess.run(["make", "-j4"])
 
     if opt.parallelCompile :
@@ -1946,16 +2032,3 @@ if __name__ == '__main__':
 
     print ("\n\n")
     print (" I'm done ... \n\n")
-
-
-
-
-
-
-
-
-
-
-
-
-
