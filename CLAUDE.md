@@ -177,6 +177,17 @@ Notes:
 - A valid X509 proxy is required; `submitBatch` checks it and aborts early if
   missing.
 - `--haddBatch` uses `haddfast.py` for shapes and `haddnano.py` for snapshots.
+- For shapes, both `--hadd` and `--haddBatch` write `root_file_joined.root`
+  into `outputDir`. That name is not free: `mkPlot.py` takes it as the default
+  `--inputFile`, `mkDatacards.py` hardcodes it, and `mkMergeYears.py` reads
+  `<folder>/rootFile/<tag>/root_file_joined.root` for each year. Changing it
+  means changing all four. The per-job inputs are `root_file___*.root`, which
+  the glob keeps distinct from the merged file so re-running cannot fold the
+  merged output back into itself.
+- For snapshots the merged file is `snapshot_<tag>.root`, deliberately *not*
+  matching `nanoLatino_snapshot____*.root`, since `makeFromSnapshot` globs that
+  pattern per sample and would otherwise read the merged file alongside its
+  own parts.
 - Compilation links ROOT (`root-config --cflags/--libs`) plus
   `-lcorrectionlib`, so `correction.h`-dependent helpers compile and link
   without extra configuration.

@@ -170,7 +170,7 @@ class MergerFactory:
          # also handles nuisance variations: histo_oldName_<nuis>up -> histo_newName_<nuis>up
          histo_rename = {f"histo_{old}": f"histo_{new}" for old, new in sample_rename.items()}
 
-         old_root_file_name = os.path.join(folder["folder"], "rootFile", folder["tag"], "plots_" + folder["tag"] + ".root")
+         old_root_file_name = os.path.join(folder["folder"], "rootFile", folder["tag"], "root_file_joined.root")
          import tempfile
          tmp_dir = tempfile.gettempdir()
          new_root_file_name = os.path.join(tmp_dir, "year_" + folderHR + "_histos_" + folder["tag"] + ".root")
