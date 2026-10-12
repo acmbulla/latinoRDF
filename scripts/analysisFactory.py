@@ -323,8 +323,110 @@ class AnalysisFactory:
             chunks.append({'files': current_files, 'range_start': None, 'range_end': None, 'nevents': current_events})
         return chunks
 
+    def _apply_split_parts(self, list_root_files, sample):
+        """
+        Filter list_root_files based on splitParts/useParts using event counts.
+        Returns a list of chunks (same format as _make_event_chunks) covering
+        only the requested fraction of total events, with Range where needed.
+
+        splitParts: int   — divide total events into N equal parts
+        useParts:   list  — which parts to use (0-indexed)
+
+        Example: splitParts=5, useParts=[0,1] → first ~40% of events
+        Files are sorted for reproducibility. Range is used when a file
+        straddles a part boundary.
+        """
+        if 'splitParts' not in sample:
+            return None  # signal: no split needed
+
+        split_parts = sample['splitParts']
+        use_parts   = set(sample.get('useParts', [0]))
+        nevents_map = getattr(self, '_nevents_map', {})
+
+        # sort files for reproducibility
+        sorted_files = sorted(list_root_files)
+
+        # get nevents per file from cache
+        file_nevents = []
+        for f in sorted_files:
+            n = nevents_map.get(f, 0)
+            if n == 0:
+                n = self._get_nevents(f)
+                nevents_map[f] = n
+            file_nevents.append(n)
+
+        total_events = sum(file_nevents)
+        if total_events == 0:
+            return []
+
+        events_per_part = total_events / split_parts
+
+        # build part boundaries: part i covers [i*epj, (i+1)*epj)
+        part_boundaries = [(int(i * events_per_part), int((i + 1) * events_per_part))
+                           for i in range(split_parts)]
+        # last part goes to end
+        part_boundaries[-1] = (part_boundaries[-1][0], total_events)
+
+        # build requested event ranges from useParts
+        requested_ranges = []
+        for p in sorted(use_parts):
+            if p < split_parts:
+                requested_ranges.append(part_boundaries[p])
+
+        # merge adjacent requested ranges
+        merged_ranges = []
+        for start, end in requested_ranges:
+            if merged_ranges and start == merged_ranges[-1][1]:
+                merged_ranges[-1] = (merged_ranges[-1][0], end)
+            else:
+                merged_ranges.append((start, end))
+
+        # now map global event ranges to file chunks with Range
+        chunks = []
+        cumulative = 0
+        file_idx   = 0
+
+        for req_start, req_end in merged_ranges:
+            # advance to the file containing req_start
+            while file_idx < len(sorted_files) and cumulative + file_nevents[file_idx] <= req_start:
+                cumulative += file_nevents[file_idx]
+                file_idx   += 1
+
+            pos = req_start
+            fi  = file_idx
+            cum = cumulative
+
+            while pos < req_end and fi < len(sorted_files):
+                file_start = cum
+                file_end   = cum + file_nevents[fi]
+
+                chunk_start = pos - file_start          # local offset in this file
+                chunk_end   = min(req_end, file_end) - file_start
+
+                full_file = (chunk_start == 0 and chunk_end == file_nevents[fi])
+
+                if full_file:
+                    chunks.append({'files': [sorted_files[fi]],
+                                   'range_start': None, 'range_end': None,
+                                   'nevents': file_nevents[fi]})
+                else:
+                    chunks.append({'files': [sorted_files[fi]],
+                                   'range_start': chunk_start, 'range_end': chunk_end,
+                                   'nevents': chunk_end - chunk_start})
+
+                pos  = file_end if chunk_end == file_nevents[fi] else req_end
+                cum += file_nevents[fi]
+                fi  += 1
+
+        return chunks
+
     def _get_chunks(self, sample, list_root_files, tree="Events"):
-        """Return list of chunks for a sample, using EventsPerJob or FilesPerJob."""
+        """Return list of chunks for a sample, using splitParts, EventsPerJob or FilesPerJob."""
+        # splitParts takes priority
+        split_chunks = self._apply_split_parts(list_root_files, sample)
+        if split_chunks is not None:
+            return split_chunks
+
         if 'EventsPerJob' in sample:
             return self._make_event_chunks(list_root_files, sample['EventsPerJob'],
                                            getattr(self, '_nevents_map', {}))
