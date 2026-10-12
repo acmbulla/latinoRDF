@@ -618,6 +618,539 @@ int main() {{
         subprocess.run(["make", "clean"])
 
     # _____________________________________________________________________________
+    #  makeFromSnapshot
+    # _____________________________________________________________________________
+
+    # _____________________________________________________________________________
+    #  makeFromSnapshot
+    # _____________________________________________________________________________
+
+    def makeFromSnapshot(self, snapshot_dir, files_per_job=50):
+        """
+        Like makeNominals but reads TTree snapshot files instead of nanoAOD.
+        files_per_job: number of snapshot files per job (default 50, set via snapshotFilesPerJob in configuration.py)
+        """
+        import json as _json
+        import glob as _glob
+
+        print("============================")
+        print("==== makeFromSnapshot   ====")
+        print(f"  -> Reading snapshots from: {snapshot_dir}")
+        print(f"  -> Files per job: {files_per_job}")
+        print("============================")
+
+        # load metadata
+        meta_path = os.path.join(snapshot_dir, 'snapshot_metadata.json')
+        metadata  = {}
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r') as f:
+                metadata = _json.load(f)
+            print(f"  -> Metadata loaded: {meta_path}")
+            print(f"     variables_saved   : {len(metadata.get('variables_saved', []))} branches")
+            print(f"     weight_nuisances  : {metadata.get('weight_nuisances', [])}")
+            print(f"     shape_nuisances   : {metadata.get('shape_nuisances', [])}")
+        else:
+            print(f"  WARNING: no metadata found at {meta_path}, proceeding without it")
+
+        weight_nuisances_available = metadata.get('weight_nuisances', [])
+        shape_nuisances_available  = metadata.get('shape_nuisances',  [])
+
+        os.makedirs(self._outputDir, exist_ok=True)
+        ROOT.TH1.SetDefaultSumw2(True)
+        os.makedirs(self._scripts_run_folder, exist_ok=True)
+        self.create_library_cpp()
+
+        list_of_files_to_compile = []
+        list_of_files_divided    = {}
+
+        for sampleName, sample in self._samples.items():
+            os.makedirs(self._scripts_run_folder + "/" + sampleName, exist_ok=True)
+            list_of_files_divided[sampleName] = []
+
+            # find all nominal snapshot files for this sample
+            snapshot_files = sorted(_glob.glob(
+                os.path.join(snapshot_dir, f"nanoLatino_snapshot____{sampleName}_*.root")
+            ))
+            # exclude patch and nuisance files
+            snapshot_files = [f for f in snapshot_files
+                              if not any(tag in os.path.basename(f)
+                                         for tag in ['_patch', '_Up', '_Down'])]
+
+            if not snapshot_files:
+                print(f"  WARNING: no snapshot files for {sampleName}")
+                continue
+
+            # chunk snapshot files into groups
+            chunks = [snapshot_files[i:i + files_per_job]
+                      for i in range(0, len(snapshot_files), files_per_job)]
+            print(f"  {sampleName}: {len(snapshot_files)} files -> {len(chunks)} jobs (FilesPerJob={files_per_job})")
+
+            weight = 'my_sample_weight'
+            aliases_ordered = {}
+
+            # build snapshot nuisances config
+            snapshot_nuisances = {}
+            for nuisanceName in weight_nuisances_available:
+                if nuisanceName in self._nuisances:
+                    nu = self._nuisances[nuisanceName]
+                    if sampleName in nu.get('samples', {}):
+                        snapshot_nuisances[nuisanceName] = {
+                            'type'      : 'shape',
+                            'kind'      : 'weight_branch',
+                            'branchUp'  : f'my_sample_weight_{nuisanceName}Up',
+                            'branchDown': f'my_sample_weight_{nuisanceName}Down',
+                            'name'      : nuisanceName,
+                            'samples'   : nu['samples'],
+                        }
+            for nuisanceName in shape_nuisances_available:
+                if nuisanceName in self._nuisances:
+                    nu = self._nuisances[nuisanceName]
+                    if sampleName in nu.get('samples', {}):
+                        snapshot_nuisances[nuisanceName] = {
+                            'type'        : 'shape',
+                            'kind'        : 'suffix_snapshot',
+                            'nuisanceName': nuisanceName,
+                            'name'        : nuisanceName,
+                            'samples'     : nu['samples'],
+                        }
+
+            subname = 'snapshot'
+            os.makedirs(self._scripts_run_folder + "/" + sampleName + "/" + subname, exist_ok=True)
+
+            for i, chunk_files in enumerate(chunks):
+                # find patch friends for each file in chunk
+                all_patch_files = []
+                shape_friends   = {}
+
+                for snap_file in chunk_files:
+                    base = os.path.basename(snap_file).replace('.root', '')
+                    patches = sorted(_glob.glob(os.path.join(snapshot_dir, f"{base}_patch*.root")))
+                    all_patch_files.extend(patches)
+
+                    for nuisanceName in shape_nuisances_available:
+                        up_path   = os.path.join(snapshot_dir, f"{base}_{nuisanceName}Up.root")
+                        down_path = os.path.join(snapshot_dir, f"{base}_{nuisanceName}Down.root")
+                        if os.path.exists(up_path) and os.path.exists(down_path):
+                            if nuisanceName not in shape_friends:
+                                shape_friends[nuisanceName] = {'Up': [], 'Down': []}
+                            shape_friends[nuisanceName]['Up'].append(up_path)
+                            shape_friends[nuisanceName]['Down'].append(down_path)
+
+                name_code = (self._scripts_run_folder + "/" + sampleName + "/" + subname
+                             + "/" + self.job_prefix() + "_" + sampleName + "_" + subname + "_" + str(i))
+                out_file  = self.output_file_name(sampleName, subname, i)
+
+                self.create_cpp_source_list_of_files_from_snapshot(
+                    name_code, "Events",
+                    nominal_files   = chunk_files,
+                    patch_files     = all_patch_files,
+                    shape_friends   = shape_friends,
+                    output_root_file_name = out_file,
+                    sampleName      = sampleName,
+                    weight          = weight,
+                    snapshot_nuisances = snapshot_nuisances,
+                )
+
+                list_of_files_to_compile.append(name_code)
+                list_of_files_divided[sampleName].append(name_code)
+
+        self.generate_makefile(list_of_files_to_compile, list_of_files_divided)
+        print("Do not compile ... If you want to compile run the compilation by hand!")
+        subprocess.run(["make", "clean"])
+        """
+        Like makeNominals but reads TTree snapshot files instead of nanoAOD.
+
+        Reads snapshot_metadata.json to understand what is available:
+        - Nominal files:  nanoLatino_snapshot____<sample>_<subname>_<i>.root
+        - Patch friends:  nanoLatino_snapshot____<sample>_<subname>_<i>_patch*.root
+        - Shape nuisances: nanoLatino_snapshot____<sample>_<subname>_<i>_<nuisanceName>Up.root
+
+        Weight nuisances: already stored as branches my_sample_weight_<name>Up/Down
+                          in the nominal TTree — used via Vary.
+        """
+        import json as _json
+        import glob as _glob
+
+        print("============================")
+        print("==== makeFromSnapshot   ====")
+        print(f"  -> Reading snapshots from: {snapshot_dir}")
+        print("============================")
+
+        # load metadata
+        meta_path = os.path.join(snapshot_dir, 'snapshot_metadata.json')
+        metadata  = {}
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r') as f:
+                metadata = _json.load(f)
+            print(f"  -> Metadata loaded: {meta_path}")
+            print(f"     variables_saved   : {len(metadata.get('variables_saved', []))} branches")
+            print(f"     weight_nuisances  : {metadata.get('weight_nuisances', [])}")
+            print(f"     shape_nuisances   : {metadata.get('shape_nuisances', [])}")
+        else:
+            print(f"  WARNING: no metadata found at {meta_path}, proceeding without it")
+
+        weight_nuisances_available = metadata.get('weight_nuisances', [])
+        shape_nuisances_available  = metadata.get('shape_nuisances',  [])
+
+        os.makedirs(self._outputDir, exist_ok=True)
+        ROOT.TH1.SetDefaultSumw2(True)
+        os.makedirs(self._scripts_run_folder, exist_ok=True)
+        self.create_library_cpp()
+
+        list_of_files_to_compile = []
+        list_of_files_divided    = {}
+
+        for sampleName, sample in self._samples.items():
+            os.makedirs(self._scripts_run_folder + "/" + sampleName, exist_ok=True)
+            list_of_files_divided[sampleName] = []
+
+            # find all nominal snapshot files for this sample
+            snapshot_files = sorted(_glob.glob(
+                os.path.join(snapshot_dir, f"nanoLatino_snapshot____{sampleName}_*.root")
+            ))
+            # exclude patch and nuisance files
+            snapshot_files = [f for f in snapshot_files
+                              if not any(tag in os.path.basename(f)
+                                         for tag in ['_patch', '_Up', '_Down'])]
+
+            if not snapshot_files:
+                print(f"  WARNING: no snapshot files for {sampleName}")
+                continue
+
+            print(f"  {sampleName}: {len(snapshot_files)} snapshot files")
+
+            # weight is already in the TTree — use my_sample_weight as weight expression
+            weight = 'my_sample_weight'
+
+            # no aliases needed — already computed in snapshot
+            # but we need to handle weight nuisances via Vary from existing branches
+            aliases_ordered = {}
+
+            # build nuisances config for fromSnapshot mode:
+            # - weight nuisances: kind='weight_branch' (new) — use existing branches
+            # - shape nuisances:  kind='suffix_snapshot' (new) — use friend TTree files
+            snapshot_nuisances = {}
+
+            for nuisanceName in weight_nuisances_available:
+                if nuisanceName in self._nuisances:
+                    nu = dict(self._nuisances[nuisanceName])
+                    if sampleName in nu.get('samples', {}):
+                        snapshot_nuisances[nuisanceName] = {
+                            'type'     : 'shape',
+                            'kind'     : 'weight_branch',
+                            'branchUp' : f'my_sample_weight_{nuisanceName}Up',
+                            'branchDown': f'my_sample_weight_{nuisanceName}Down',
+                            'name'     : nuisanceName,
+                            'samples'  : nu['samples'],
+                        }
+
+            for nuisanceName in shape_nuisances_available:
+                if nuisanceName in self._nuisances:
+                    nu = dict(self._nuisances[nuisanceName])
+                    if sampleName in nu.get('samples', {}):
+                        snapshot_nuisances[nuisanceName] = {
+                            'type'        : 'shape',
+                            'kind'        : 'suffix_snapshot',
+                            'nuisanceName': nuisanceName,
+                            'name'        : nuisanceName,
+                            'samples'     : nu['samples'],
+                        }
+
+            subname = 'snapshot'
+            os.makedirs(self._scripts_run_folder + "/" + sampleName + "/" + subname, exist_ok=True)
+
+            for i, snap_file in enumerate(snapshot_files):
+                # find patch friends for this file
+                base = os.path.basename(snap_file).replace('.root', '')
+                patch_files = sorted(_glob.glob(
+                    os.path.join(snapshot_dir, f"{base}_patch*.root")
+                ))
+
+                # find shape nuisance files for this file
+                # e.g. nanoLatino_snapshot____DY_inclusive_0_JESup.root
+                shape_friends = {}   # nuisanceName -> {'Up': path, 'Down': path}
+                for nuisanceName in shape_nuisances_available:
+                    up_path   = os.path.join(snapshot_dir, f"{base}_{nuisanceName}Up.root")
+                    down_path = os.path.join(snapshot_dir, f"{base}_{nuisanceName}Down.root")
+                    if os.path.exists(up_path) and os.path.exists(down_path):
+                        shape_friends[nuisanceName] = {'Up': up_path, 'Down': down_path}
+                    else:
+                        print(f"    WARNING: shape nuisance files not found for {nuisanceName} / {base}")
+
+                name_code = (self._scripts_run_folder + "/" + sampleName + "/" + subname
+                             + "/" + self.job_prefix() + "_" + sampleName + "_" + subname + "_" + str(i))
+                out_file  = self.output_file_name(sampleName, subname, i)
+
+                self.create_cpp_source_list_of_files_from_snapshot(
+                    name_code, "Events",
+                    nominal_file    = snap_file,
+                    patch_files     = patch_files,
+                    shape_friends   = shape_friends,
+                    output_root_file_name = out_file,
+                    sampleName      = sampleName,
+                    weight          = weight,
+                    snapshot_nuisances = snapshot_nuisances,
+                )
+
+                list_of_files_to_compile.append(name_code)
+                list_of_files_divided[sampleName].append(name_code)
+
+        self.generate_makefile(list_of_files_to_compile, list_of_files_divided)
+        print("Do not compile ... If you want to compile run the compilation by hand!")
+        subprocess.run(["make", "clean"])
+
+    # _____________________________________________________________________________
+    #  create_cpp_source_list_of_files_from_snapshot
+    # _____________________________________________________________________________
+
+    def create_cpp_source_list_of_files_from_snapshot(
+            self, output_name, tree_name,
+            nominal_files, patch_files, shape_friends,
+            output_root_file_name, sampleName, weight,
+            snapshot_nuisances):
+        """
+        nominal_files:  list of snapshot files (all added to same TChain)
+        patch_files:    list of friend TTrees with extra columns
+        shape_friends:  {nuisanceName: {'Up': [paths], 'Down': [paths]}}
+        """
+
+        # ---- input files ----
+        define_input_files_logic = f'//  Nominal snapshot files\n'
+        define_input_files_logic += f'    auto* nominal = new TChain("{tree_name}");\n'
+        for f in nominal_files:
+            define_input_files_logic += f'    nominal->Add("{f}");\n'
+
+        # patch friends
+        if patch_files:
+            define_input_files_logic += f'\n//  Patch friend TTrees\n'
+            for pi, pf in enumerate(patch_files):
+                define_input_files_logic += f'    auto* patch_{pi} = new TChain("{tree_name}");\n'
+                define_input_files_logic += f'    patch_{pi}->Add("{pf}");\n'
+                define_input_files_logic += f'    nominal->AddFriend(patch_{pi}, "patch_{pi}");\n'
+
+        # shape nuisance friend TTrees
+        if shape_friends:
+            define_input_files_logic += f'\n//  Shape nuisance friend TTrees\n'
+            for nuisanceName, paths in shape_friends.items():
+                define_input_files_logic += f'    auto* friend_{nuisanceName}Up   = new TChain("{tree_name}");\n'
+                define_input_files_logic += f'    auto* friend_{nuisanceName}Down = new TChain("{tree_name}");\n'
+                for p in paths['Up']:
+                    define_input_files_logic += f'    friend_{nuisanceName}Up->Add("{p}");\n'
+                for p in paths['Down']:
+                    define_input_files_logic += f'    friend_{nuisanceName}Down->Add("{p}");\n'
+                define_input_files_logic += f'    nominal->AddFriend(friend_{nuisanceName}Up,   "{nuisanceName}Up");\n'
+                define_input_files_logic += f'    nominal->AddFriend(friend_{nuisanceName}Down, "{nuisanceName}Down");\n'
+
+        define_input_files_logic += f'\n    ROOT::RDataFrame base_df(*nominal);\n'
+        define_input_files_logic += f'    auto varied_df = ROOT::RDF::RNode(base_df);\n'
+
+        # ---- weight (already in TTree) ----
+        define_weights  = f'//  Weight already in TTree\n'
+        define_weights += f'    varied_df = SafeDefine(varied_df, "my_sample_weight", "{weight}");\n'
+
+        # ---- nuisance variations ----
+        register_variations = "//  Variations from snapshot\n"
+
+        for nuisanceName, nuisance in snapshot_nuisances.items():
+            if sampleName not in nuisance.get('samples', {}):
+                continue
+
+            if nuisance['kind'] == 'weight_branch':
+                # weight nuisance: branch already in TTree, use Vary
+                bUp = nuisance['branchUp']
+                bDo = nuisance['branchDown']
+                register_variations += f'''    varied_df = varied_df.Vary(
+      "my_sample_weight",
+      "ROOT::RVecD{{{bUp},{bDo}}}",
+      {{"up", "do"}},
+      "{nuisanceName}"
+    );\n'''
+
+            elif nuisance['kind'] == 'suffix_snapshot':
+                # shape nuisance from friend TTree: columns accessible as <alias>.<branch>
+                # use Vary on each branch that exists in the friend
+                register_variations += f'    // shape nuisance {nuisanceName} from friend TTree\n'
+                register_variations += f'    {{\n'
+                register_variations += f'      auto existingCols = varied_df.GetColumnNames();\n'
+                register_variations += f'      for (const auto& col : existingCols) {{\n'
+                register_variations += f'        std::string upCol   = "{nuisanceName}Up."   + col;\n'
+                register_variations += f'        std::string downCol = "{nuisanceName}Down." + col;\n'
+                register_variations += f'        auto allCols = varied_df.GetColumnNames();\n'
+                register_variations += f'        bool hasUp   = std::find(allCols.begin(), allCols.end(), upCol)   != allCols.end();\n'
+                register_variations += f'        bool hasDown = std::find(allCols.begin(), allCols.end(), downCol) != allCols.end();\n'
+                register_variations += f'        if (hasUp && hasDown) {{\n'
+                register_variations += f'          std::string col_type = varied_df.GetColumnType(col);\n'
+                register_variations += f'          std::string expr = (col_type.find("RVec") != std::string::npos)\n'
+                register_variations += f'            ? "ROOT::RVec<" + col_type + ">{{" + upCol + ", " + downCol + "}}"\n'
+                register_variations += f'            : "ROOT::RVec<" + col_type + ">{{static_cast<" + col_type + ">(" + upCol + "), static_cast<" + col_type + ">(" + downCol + ")}}";\n'
+                register_variations += f'          varied_df = varied_df.Vary(col, expr, {{"up","do"}}, "{nuisanceName}");\n'
+                register_variations += f'        }}\n'
+                register_variations += f'      }}\n'
+                register_variations += f'    }}\n'
+
+        # ---- booking + cuts + histograms ----
+        booking_logic = f'    auto current_node = ROOT::RDF::RNode(varied_df);\n'
+
+        define_variables_logic = ""
+        for variableName, variable in self._variables.items():
+            if not ('is2d' in variable and variable['is2d'] == 1):
+                name = variable['name']
+                define_variables_logic += f'    current_node = SafeDefine(current_node, "{variableName}", "{name}");\n'
+
+        if self._supercut:
+            define_variables_logic += f'    current_node = current_node.Filter("{self._supercut}", "supercut");\n'
+
+        # store subsamples empty for fromSnapshot
+        self._current_subsamples = {}
+        define_variables_logic += self._build_cpp_cuts_and_output(sampleName)
+
+        # nuisance maps for special nuisances (empty in snapshot mode)
+        register_maps_special = ""
+
+        cpp_code = f"""
+#include "library_utils.h"
+#include "ROOT/RDataFrame.hxx"
+#include "ROOT/RDFHelpers.hxx"
+#include "ROOT/RVec.hxx"
+#include <iostream>
+#include <algorithm>
+#include "TFile.h"
+#include "TH1D.h"
+#include "TDirectory.h"
+#include "TChain.h"
+#include <map>
+#include <vector>
+#include <string>
+#include <typeinfo>
+#include <regex>
+#include "TMVA/RReader.hxx"
+#include "TMVA/RInferenceUtils.hxx"
+
+int main() {{
+    ROOT::DisableImplicitMT();
+
+    {define_input_files_logic}
+
+    std::map<std::string, std::vector<ROOT::RDF::RResultPtr<TH1D>>> hist_map_1D;
+    std::map<std::string, std::vector<ROOT::RDF::RResultPtr<TH2D>>> hist_map_2D;
+
+    {register_variations}
+
+    {define_weights}
+
+    {booking_logic}
+
+    {define_variables_logic}
+
+    // Variations + RunGraphs
+    std::vector<ROOT::RDF::Experimental::RResultMap<TH1D>> results_1D_variations;
+    std::vector<ROOT::RDF::Experimental::RResultMap<TH2D>> results_2D_variations;
+    std::vector<ROOT::RDF::RResultHandle> all_booking_1D;
+    std::vector<ROOT::RDF::RResultHandle> all_booking_2D;
+
+    for (auto& [cut_label, h_list] : hist_map_1D) {{
+      for (auto& h : h_list) {{
+        results_1D_variations.push_back( ROOT::RDF::Experimental::VariationsFor(h) );
+        all_booking_1D.push_back(h);
+      }}
+    }}
+    for (auto& [cut_label, h_list] : hist_map_2D) {{
+      for (auto& h : h_list) {{
+        results_2D_variations.push_back( ROOT::RDF::Experimental::VariationsFor(h) );
+        all_booking_2D.push_back(h);
+      }}
+    }}
+
+    if (!hist_map_1D.empty()) ROOT::RDF::RunGraphs(all_booking_1D);
+    if (!hist_map_2D.empty()) ROOT::RDF::RunGraphs(all_booking_2D);
+
+    std::map<std::string, std::pair<std::string, int>> map_nuisances_name_for_averaged_histograms;
+    {register_maps_special}
+
+    TFile out_file("{self._outputDir}/{output_root_file_name}", "RECREATE");
+    int big_loop = 0;
+    for (auto& [cut_label, h_list] : hist_map_1D) {{
+      std::string current_cut = cut_label;
+      std::string sub_name = "";
+      size_t pos_triple = cut_label.find("___");
+      if (pos_triple != std::string::npos) {{
+        std::string rest = cut_label.substr(pos_triple + 3);
+        std::string sN = "{sampleName}";
+        size_t pos = rest.find(sN);
+        sub_name = rest.substr(pos + sN.length() + 1);
+        current_cut = cut_label.substr(0, pos_triple);
+      }}
+      TDirectory *dir = out_file.GetDirectory(current_cut.c_str());
+      if (!dir) dir = out_file.mkdir(current_cut.c_str());
+      for (size_t ivar = 0; ivar < h_list.size(); ivar++) {{
+        dir->cd();
+        TDirectory *subdir = out_file.GetDirectory((current_cut+"/"+list_of_variables_1D.at(ivar)).c_str());
+        if (!subdir) subdir = out_file.mkdir((current_cut+"/"+list_of_variables_1D.at(ivar)).c_str());
+        subdir->cd();
+        auto all_histos = results_1D_variations.at(big_loop++);
+        for (auto& [name, histo] : all_histos) {{
+          std::string temp_name;
+          if (name == "nominal") {{
+            temp_name = (sub_name == "") ? "histo_{sampleName}" : "histo_{sampleName}_" + sub_name;
+          }} else {{
+            temp_name = name;
+            temp_name.erase(std::remove(temp_name.begin(), temp_name.end(), ':'), temp_name.end());
+            temp_name = (sub_name == "") ? "histo_{sampleName}_" + temp_name : "histo_{sampleName}_" + sub_name + "_" + temp_name;
+          }}
+          gDirectory = subdir;
+          histo->SetName(temp_name.c_str());
+          if (list_of_variables_fold_1D.at(ivar) != 0) FoldHistogram(histo.get(), list_of_variables_fold_1D.at(ivar));
+          histo->Write();
+        }}
+      }}
+      out_file.cd();
+    }}
+    big_loop = 0;
+    for (auto& [cut_label, h_list] : hist_map_2D) {{
+      std::string current_cut = cut_label;
+      std::string sub_name = "";
+      size_t pos_triple = cut_label.find("___");
+      if (pos_triple != std::string::npos) {{
+        std::string rest = cut_label.substr(pos_triple + 3);
+        std::string sN = "{sampleName}";
+        size_t pos = cut_label.find(sN);
+        sub_name = cut_label.substr(pos + sN.length() + 1);
+        current_cut = cut_label.substr(0, pos_triple);
+      }}
+      TDirectory *dir = out_file.GetDirectory(current_cut.c_str());
+      if (!dir) dir = out_file.mkdir(current_cut.c_str());
+      for (size_t ivar = 0; ivar < h_list.size(); ivar++) {{
+        dir->cd();
+        TDirectory *subdir = out_file.GetDirectory((current_cut+"/"+list_of_variables_2D.at(ivar)).c_str());
+        if (!subdir) subdir = out_file.mkdir((current_cut+"/"+list_of_variables_2D.at(ivar)).c_str());
+        subdir->cd();
+        auto all_histos = results_2D_variations.at(big_loop++);
+        for (auto& [name, histo] : all_histos) {{
+          std::string temp_name;
+          if (name == "nominal") {{
+            temp_name = (sub_name == "") ? "histo_{sampleName}" : "histo_{sampleName}_" + sub_name;
+          }} else {{
+            temp_name = name;
+            temp_name.erase(std::remove(temp_name.begin(), temp_name.end(), ':'), temp_name.end());
+            temp_name = (sub_name == "") ? "histo_{sampleName}_" + temp_name : "histo_{sampleName}_" + sub_name + "_" + temp_name;
+          }}
+          gDirectory = subdir;
+          histo->SetName(temp_name.c_str());
+          if (list_of_variables_fold_2D.at(ivar) != 0) FoldHistogram(histo.get(), list_of_variables_fold_2D.at(ivar));
+          auto new_histo = UnrollHistogram(dynamic_cast<TH2D*>(histo.get()));
+          new_histo->Write();
+        }}
+      }}
+      out_file.cd();
+    }}
+    out_file.Close();
+    return 0;
+}}
+"""
+        with open(f"{output_name}.cpp", "w") as f:
+            f.write(cpp_code)
+
+    # _____________________________________________________________________________
     #  haddBatch — submit a single condor job to hadd all root files
     # _____________________________________________________________________________
 
@@ -718,6 +1251,8 @@ if __name__ == '__main__':
     parser = defaultParser()
     parser.add_argument("--parallelCompile", action='store_true', dest="parallelCompile")
     parser.add_argument("--localCompile",    action='store_true', dest="localCompile")
+    parser.add_argument("--fromSnapshot",    action='store_true', dest="fromSnapshot",
+                        help="Read TTree snapshots instead of nanoAOD")
     parser.add_argument("--submitBatch",     action='store_true', dest="submitBatch")
     parser.add_argument("--hadd",            action='store_true', dest="haddRootFiles")
     parser.add_argument("--haddBatch",       action='store_true', dest="haddBatch",
@@ -748,8 +1283,17 @@ if __name__ == '__main__':
     factory.setConditions(opt.silentMode)
 
     if not any([opt.submitBatch, opt.haddRootFiles, opt.haddBatch, opt.checkBatch,
-                opt.localCompile, opt.parallelCompile]):
+                opt.localCompile, opt.parallelCompile, opt.fromSnapshot]):
         factory.makeNominals()
+
+    if opt.fromSnapshot:
+        snapshot_dir = getattr(opt, 'snapshotDir', None) or \
+                       getattr(opt, 'folder_where_to_save_trees', None) or \
+                       os.path.join(os.path.expandvars(opt.outputDir), 'snapshot')
+        snapshot_dir    = os.path.expandvars(snapshot_dir)
+        files_per_job   = int(getattr(opt, 'snapshotFilesPerJob', 50))
+        print(f"fromSnapshot: reading from {snapshot_dir}, {files_per_job} files/job")
+        factory.makeFromSnapshot(snapshot_dir, files_per_job=files_per_job)
 
     if opt.localCompile:
         subprocess.run(["make", "-j4"])
