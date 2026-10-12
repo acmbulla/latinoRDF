@@ -155,17 +155,20 @@ class SnapshotFactory:
     # _____________________________________________________________________________
     #                                                              "file_path" is a list of root files!
     def create_cpp_source_list_of_files(self, output_name, tree_name, file_path, output_root_file_name, sampleName, weight,
-                                        aliases_to_be_defined, functions_to_be_defined,
-                                        range_start=None, range_end=None):
+                                        aliases_to_be_defined, functions_to_be_defined):
+
+        # This is your C++ template as a Python string
 
         define_input_files_logic = ""
+
         define_input_files_logic += f"//  Nominal input files\n"
+
         define_input_files_logic += f'    auto* nominal = new TChain("{tree_name}");\n'
 
         for file_name in file_path:
           define_input_files_logic += f'    nominal->Add("{file_name}");\n'
 
-        define_input_files_logic += f'    \n'
+
         define_input_files_logic += f'    ROOT::RDataFrame base_df(*nominal);\n'
         define_input_files_logic += f'    auto varied_df = ROOT::RDF::RNode(base_df);\n'
 
@@ -185,6 +188,7 @@ class SnapshotFactory:
         for aliasName, alias in aliases_to_be_defined.items():
           define_aliases += f'    varied_df = SafeDefine(varied_df, "{aliasName}", "{alias}");\n'
 
+
         #
         # define the aliases and functions needed for this specific sample
         #
@@ -193,29 +197,33 @@ class SnapshotFactory:
         define_aliases_functions = ""
         define_aliases_functions += f"//  aliases of functions\n"
 
+        # not SafeDefine since these are new variables ... make it so!
         for aliasName, alias in functions_to_be_defined.items():
           if 'external' in alias.keys():
-            with open(alias["external"], "r") as file:
+            with open(alias["external"], "r") as file: # this is the file with the c++ code to be included
               code_of_function_to_include += file.read()
           code_of_function_to_include += "\n"
 
           define_aliases_functions += "    varied_df = varied_df"
 
-          if 'xmlfile' not in alias.keys():
+          if 'xmlfile' not in alias.keys(): # if "xmlfile" is present, it's a TMVA and it requires casting to float
             for i, var in enumerate(alias["variables"]):
               define_aliases_functions += f'\n                     .Define("_var_{aliasName}_{i}", "{var}")'
+          # if "xmlfile" is present, it's a TMVA
           elif 'xmlfile' in alias.keys():
             for i, var in enumerate(alias["variables"]):
               define_aliases_functions += f'\n                     .Define("_var_{aliasName}_{i}_f", "(float){var}")'
 
           define_aliases_functions += ";\n"
 
+          # if a simple c++ function
           if 'xmlfile' not in alias.keys():
             define_aliases_functions += f'\n'
             new_names = [f"_var_{aliasName}_{i}" for i in range(len(alias["variables"]))]
             sintax_variables = '{ "' + '", "'.join(new_names) + '" }'
             define_aliases_functions += f'    varied_df = varied_df.Define("{aliasName}", {alias["function"]}, {sintax_variables} );\n'
             define_aliases_functions += f'\n'
+          # if "xmlfile" is present, it's a TMVA
           elif 'xmlfile' in alias.keys():
             define_aliases_functions += f'\n'
             submission_dir = os.getcwd()
@@ -231,11 +239,18 @@ class SnapshotFactory:
 
 
         booking_logic = ""
+
+        #
+        # In RDataFrame, all variables must be defined before being plotted/used
+        # The pro of this is that they can be used also in cuts
+        #
+        #
+        # In case of already defined variables, for example "mll", and "mll" is already defined in the TTree,
+        # the code "SafeDefine" should handle this, and "Define" a variable only when needed
+        #
+
         booking_logic += f"//  Initial ...\n"
         booking_logic += f'    auto current_node = ROOT::RDF::RNode(varied_df);\n'
-        if range_start is not None and range_end is not None:
-          booking_logic += f'    current_node = ROOT::RDF::RNode(current_node.Range({range_start}, {range_end}));\n'
-          booking_logic += f'    std::cout << "   Range: [{range_start}, {range_end})" << std::endl;\n'
 
 
         define_variables_logic = ""
@@ -390,11 +405,10 @@ int main() {{
 
 
     # _____________________________________________________________________________
-    def generate_makefile(self, file_paths, makefile_name="MakefileSnapshot"):
+    def generate_makefile(self, file_paths, makefile_name):
         # Get ROOT configuration via shell calls
         cpp_flags = "$(shell root-config --cflags)"
-        ld_flags = "$(shell root-config --libs) -lTMVA -lXMLIO"
-
+        ld_flags = "$(shell root-config --libs) -lTMVA -lXMLIO"  # why TMVA is not by default?!?
         type_of_compilation = "-O2"
         # from "blabla.cpp" to "blabla"
         targets = [os.path.splitext(f)[0] for f in file_paths]
@@ -402,6 +416,7 @@ int main() {{
         with open(makefile_name, "w") as f:
             f.write("# Generated Makefile\n")
             f.write("CXX = g++\n")
+            # f.write(f"CXXFLAGS = {type_of_compilation} -Wall {cpp_flags} -std=c++20 -Wcpp \n")  # c++20 used for "ends_with"
             f.write(f"CXXFLAGS = {type_of_compilation} -Wall {cpp_flags} \n")
             f.write(f"LDFLAGS = {ld_flags}\n\n")
 
@@ -409,20 +424,21 @@ int main() {{
             all_targets = " ".join(targets)
             f.write(f"all: {all_targets}\n\n")
 
-            # Pattern rule: works across subdirectories automatically
+            # The Pattern Rule
+            # This says: To create ANY executable 'X', look for 'X.cpp'
+            # It works across subdirectories automatically.
             f.write("%: %.cpp\n")
             f.write("\t$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)\n\n")
 
-            # Clean target — use find to avoid "Argument list too long" with many targets
+            # Clean target
             f.write("clean:\n")
-            f.write(f"\tfind {self._scripts_run_folder} -type f ! -name '*.cpp' ! -name '*.h' -delete\n")
+            f.write(f"\trm -f {all_targets}\n")
+
+
 
 
     # _____________________________________________________________________________
-    def setValues(self, variables, cuts, supercut, samples, aliases,
-                  variables_to_dump, cut_to_dump, folder_where_to_save_trees,
-                  batch_script_location='./scripts_snapshot_batch/',
-                  scripts_run_folder=None):
+    def setValues(self, variables, cuts, supercut, samples , aliases, variables_to_dump, cut_to_dump, folder_where_to_save_trees):
 
         self._variables = variables
         self._samples   = samples
@@ -432,11 +448,7 @@ int main() {{
 
         self._variables_to_dump           = variables_to_dump
         self._cut_to_dump                 = cut_to_dump
-        self._folder_where_to_save_trees  = os.path.expandvars(folder_where_to_save_trees)
-        self._script_batch_location       = os.path.expandvars(batch_script_location)
-
-        if scripts_run_folder is not None:
-            self._scripts_run_folder = os.path.expandvars(scripts_run_folder)
+        self._folder_where_to_save_trees  = folder_where_to_save_trees
 
 
     # _____________________________________________________________________________
@@ -446,176 +458,52 @@ int main() {{
 
 
     # _____________________________________________________________________________
-    @staticmethod
-    def _get_nevents(file_path, tree_name="Events"):
-        try:
-            f = ROOT.TFile.Open(file_path)
-            if not f or f.IsZombie():
-                print(f"  WARNING: cannot open {file_path}, assuming 0 events")
-                return 0
-            t = f.Get(tree_name)
-            if not t:
-                print(f"  WARNING: tree '{tree_name}' not found in {file_path}, assuming 0 events")
-                f.Close()
-                return 0
-            n = t.GetEntries()
-            f.Close()
-            return n
-        except Exception as e:
-            print(f"  WARNING: exception reading {file_path}: {e}")
-            return 0
-
-
-    # _____________________________________________________________________________
-    @staticmethod
-    def _get_nevents_worker(args):
-        """Worker for multiprocessing: returns (file_path, mtime, nevents)."""
-        file_path, tree_name = args
-        try:
-            mtime = os.path.getmtime(file_path)
-        except Exception:
-            mtime = 0
-        n = SnapshotFactory._get_nevents(file_path, tree_name)
-        return file_path, mtime, n
-
-
-    # _____________________________________________________________________________
-    def _load_events_cache(self):
-        import json
-        base = os.path.expandvars("${MY_PATH_JOBS}")
-        cache_path = os.path.join(base, "events_cache.json")
-        if os.path.exists(cache_path):
-            try:
-                with open(cache_path, 'r') as f:
-                    return json.load(f), cache_path
-            except Exception:
-                pass
-        return {}, cache_path
-
-
-    # _____________________________________________________________________________
-    def _save_events_cache(self, cache, cache_path):
-        import json
-        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-        with open(cache_path, 'w') as f:
-            json.dump(cache, f, indent=2)
-
-
-    # _____________________________________________________________________________
-    def _count_events(self, all_files, tree_name="Events", n_workers=8):
-        """
-        Count events for all_files using multiprocessing + JSON cache.
-        Cache key: file_path -> {mtime, nevents}. If mtime matches, skip recount.
-        """
-        import multiprocessing
-
-        cache, cache_path = self._load_events_cache()
-
-        results  = {}
-        to_count = []
-
-        for fp in all_files:
-            try:
-                mtime = os.path.getmtime(fp)
-            except Exception:
-                mtime = 0
-            entry = cache.get(fp)
-            if entry and abs(entry.get('mtime', -1) - mtime) < 1.0:
-                results[fp] = entry['nevents']
-            else:
-                to_count.append(fp)
-
-        if to_count:
-            print(f"  -> Counting events in {len(to_count)} files ({len(results)} from cache) using {n_workers} workers...")
-            with multiprocessing.Pool(processes=n_workers) as pool:
-                counted = pool.map(SnapshotFactory._get_nevents_worker,
-                                   [(fp, tree_name) for fp in to_count])
-            for fp, mtime, n in counted:
-                results[fp] = n
-                cache[fp] = {'mtime': mtime, 'nevents': n}
-                print(f"    {fp}  ->  {n} events")
-            self._save_events_cache(cache, cache_path)
-            print(f"  -> Cache saved: {cache_path}")
-        else:
-            print(f"  -> All {len(results)} files found in cache, skipping event counting.")
-
-        return results
-
-
-    # _____________________________________________________________________________
-    @staticmethod
-    def _make_event_chunks(list_root_files, events_per_job, nevents_map):
-        """Group files into chunks using a precomputed {file: nevents} map."""
-        chunks = []
-        current_files  = []
-        current_events = 0
-
-        for file_path in list_root_files:
-            n = nevents_map.get(file_path, 0)
-            if n == 0:
-                continue
-            if n > events_per_job:
-                if current_files:
-                    chunks.append({'files': current_files, 'range_start': None, 'range_end': None, 'nevents': current_events})
-                    current_files  = []
-                    current_events = 0
-                start = 0
-                while start < n:
-                    end = min(start + events_per_job, n)
-                    chunks.append({'files': [file_path], 'range_start': start, 'range_end': end, 'nevents': end - start})
-                    start = end
-            else:
-                if current_events + n > events_per_job and current_files:
-                    chunks.append({'files': current_files, 'range_start': None, 'range_end': None, 'nevents': current_events})
-                    current_files  = []
-                    current_events = 0
-                current_files.append(file_path)
-                current_events += n
-
-        if current_files:
-            chunks.append({'files': current_files, 'range_start': None, 'range_end': None, 'nevents': current_events})
-
-        return chunks
-
-
-    # _____________________________________________________________________________
     def makeScripts(self):
 
         print ("=====================")
         print ("==== makeScripts ====")
         print ("=====================")
 
-        os.makedirs(self._folder_where_to_save_trees, exist_ok=True)
+        os.system ("mkdir " + self._folder_where_to_save_trees + "/")
 
-        os.makedirs(self._scripts_run_folder, exist_ok=True)
+        os.system ("mkdir " + self._scripts_run_folder + "/")
 
         list_of_files_to_compile = []
 
-        # collect all files that need event counting (EventsPerJob samples)
-        all_files_to_count = []
+        # print ("length of samples = ", len(self._samples))
+        #
+        # Loop over samples
+        #
         for sampleName, sample in self._samples.items():
-          if 'EventsPerJob' in sample:
-            for subname, list_root_files in sample['name'].items():
-              all_files_to_count.extend(list_root_files)
-
-        nevents_map = {}
-        if all_files_to_count:
-          print(f"\n  -> Pre-counting events for {len(all_files_to_count)} files...")
-          nevents_map = self._count_events(all_files_to_count, tree_name="Events")
-          print(f"  -> Event counting done.\n")
-
-        for sampleName, sample in self._samples.items():
-          os.makedirs(self._scripts_run_folder + "/" + sampleName, exist_ok=True)
+          os.system ("mkdir " + self._scripts_run_folder + "/" + sampleName + "/")
+          #
+          # create an executable for each file in each sample
+          #
+          # samples is a dictionary: {'subname' : [list of root files] }
+          #
 
           global_weight = sample['weight'] if 'weight' in sample.keys() else "1."
+
+          # weight per "sub-dataset"
           weights_subname = sample['weights'] if 'weights' in sample.keys() else {}
 
+
+          #
+          # check if "isData". If NOT isData then multiply by lumi otherwise no
+          #
           if 'isData' in sample.keys() :
             if not (len(sample ['isData']) == 1 and sample ['isData'][0] == 'all') :
+              # if you put 'all', all the root files are considered "data"
+              # ok, it's data ... and so now?
+              #
               pass
-          else :
+          else : # default is "scale to luminosity"
             global_weight = f"({global_weight}) * {self._lumi}"
 
+
+          #
+          # check if additional "Define" is needed, from "alises"
+          #
           aliases_to_be_defined = {}
           functions_to_be_defined = {}
           for aliasName, alias in self._aliases.items():
@@ -625,43 +513,54 @@ int main() {{
               if sampleName in alias['samples'] and 'function' in alias.keys():
                 functions_to_be_defined[aliasName] = alias
 
-          for subname, list_root_files in sample['name'].items():
-            print (f"  {sampleName}/{subname}: {len(list_root_files)} files")
-            os.makedirs(self._scripts_run_folder + "/" + sampleName + "/" + subname, exist_ok=True)
 
+          for subname, list_root_files in sample['name'].items():
+            print ("length of list_root_files = ", len(list_root_files))
+            os.system ("mkdir " + self._scripts_run_folder + "/" + sampleName + "/" + subname + "/")
+
+            # if weights per subname are listed, use them
+            # e.g. per PD weights in data
+            #
             if subname in weights_subname.keys():
               weight = f"({global_weight}) * ({weights_subname[subname]})"
             else :
               weight = global_weight
 
-            tree = "Events"
+            #
+            # Merge together different root files in one single job, not to have billions of jobs :)
+            #
+            make_job_every_N = 1
+            if "FilesPerJob" in sample.keys():
+              make_job_every_N = sample['FilesPerJob']
+            #
+            # create a list of lists of root files, one per job to be submitted
+            # [ [root1, root2, root3], [root4, root5]]
+            #
+            chunks_list_root_files = [list_root_files[i:i + make_job_every_N] for i in range(0, len(list_root_files), make_job_every_N)]
 
-            if 'EventsPerJob' in sample:
-              chunks = self._make_event_chunks(list_root_files, sample['EventsPerJob'], nevents_map)
-              print(f"  -> {len(chunks)} jobs created")
-            else:
-              make_job_every_N = sample.get('FilesPerJob', 1)
-              chunks = [{'files': list_root_files[i:i + make_job_every_N], 'range_start': None, 'range_end': None, 'nevents': None}
-                        for i in range(0, len(list_root_files), make_job_every_N)]
-
-            for i, chunk in enumerate(chunks):
+            for i, root_files in enumerate(chunks_list_root_files):
               name_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/" + "my_snapshot_" + sampleName + "_" + subname + "_" + str(i)
+              tree = "Events"
+
               output_root_file_name = "nanoLatino_snapshot____" + sampleName + "_" + subname + "_" + str(i) + ".root"
 
-              self.create_cpp_source_list_of_files(name_code, tree, chunk['files'], output_root_file_name, sampleName, weight,
-                                                   aliases_to_be_defined, functions_to_be_defined,
-                                                   range_start=chunk.get('range_start'),
-                                                   range_end=chunk.get('range_end'))
+              self.create_cpp_source_list_of_files(name_code, tree, root_files, output_root_file_name, sampleName, weight,
+                                                   aliases_to_be_defined, functions_to_be_defined)
 
-              list_of_files_to_compile.append(name_code + ".cpp")
+              list_of_files_to_compile.append(name_code)
 
 
-        # [MODIFIED] generate Makefile but do NOT compile automatically — same pattern as mkShapes
+
         self.generate_makefile(list_of_files_to_compile, "MakefileSnapshot")
-        subprocess.run(["make", "-f", "MakefileSnapshot", "clean"])
-        print("Scripts generated. To compile run:")
-        print("    make -f MakefileSnapshot -j8")
-        print("Or use --localCompile to compile automatically.")
+
+        # Run the compilation in parallel
+        print("Start parallel compilation...")
+        subprocess.run(["make", "-f", "MakefileSnapshot", "-j8"])
+        #
+        # subprocess.run() is a blocking call -> it will make the compilation to end before the next step
+        #
+
+
 
 
     # _____________________________________________________________________________
@@ -691,8 +590,7 @@ int main() {{
               if os.path.exists(name_err_file):
                 with open(name_err_file, 'r') as f:
                   line_count = sum(1 for line in f)
-                  if line_count > 1: # should I remove the warnings to have 0?
-                    # FIXME
+                  if line_count > 1: # should I remove the warnings to have 0? FIXME
                     list_jobs_with_error.append(name_err_file)
               output_root_file_name = "nanoLatino_snapshot____" + sampleName + "_" + subname + "_" + str(i) + ".root"
               root_file_name = f"{self._folder_where_to_save_trees}/{output_root_file_name}"
@@ -726,188 +624,90 @@ int main() {{
         print ("==== submit Batch ====")
         print ("======================")
 
-        os.makedirs(self._script_batch_location, exist_ok=True)
+        os.system ("mkdir " + self._script_batch_location + "/")
 
         submission_dir = os.getcwd()
 
-        try:
-            root_cflags = subprocess.check_output(["root-config", "--cflags"]).decode().strip()
-            root_libs   = subprocess.check_output(["root-config", "--libs"]).decode().strip()
-        except Exception:
-            root_cflags = ""
-            root_libs   = ""
-
-        # detect mode: check if first expected executable exists
-        first_exe = None
+        #
+        # Loop over samples
+        #
         for sampleName, sample in self._samples.items():
-          for subname, list_root_files in sample['name'].items():
-            if list_root_files:
-              first_exe = os.path.join(self._scripts_run_folder, sampleName, subname,
-                                       "my_snapshot_" + sampleName + "_" + subname + "_0")
-              break
-          if first_exe:
-            break
-
-        precompiled = first_exe is not None and os.path.isfile(first_exe)
-
-        if precompiled:
-            print("  -> Pre-compiled executables found: transferring binaries to worker nodes.")
-        else:
-            print("  -> No pre-compiled executables found: worker nodes will compile before running.")
-
-        # X509 proxy check
-        _proxy_candidates = [
-            os.environ.get('X509_USER_PROXY', ''),
-            os.path.expanduser('~/.proxy'),
-            f"/tmp/x509up_u{os.getuid()}",
-        ]
-        x509_proxy = next((p for p in _proxy_candidates if p and os.path.exists(p)), None)
-        if x509_proxy:
-            proxy_check = subprocess.run(["voms-proxy-info", "--exists", "--valid", "1:00"],
-                                         capture_output=True)
-            if proxy_check.returncode != 0:
-                print(f"ERROR: proxy found at {x509_proxy} but it is expired or invalid.")
-                print("       Please run: voms-proxy-init --voms cms --valid 168:00")
-                print("       then rerun --submitBatch")
-                return
-            proxy_basename = os.path.basename(x509_proxy)
-            proxy_lines = f"export X509_USER_PROXY=$(pwd)/{proxy_basename}\nexport EOS_MGM_URL=root://eosuser.cern.ch\nvoms-proxy-info\n"
-            print(f"  -> X509 proxy found and valid: {x509_proxy}")
-        else:
-            print("ERROR: no X509 proxy found.")
-            print("       Please run: voms-proxy-init --voms cms --valid 168:00")
-            print("       then rerun --submitBatch")
-            return
-
-        queue_rows = []
-
-        # collect all files that need event counting (EventsPerJob samples)
-        all_files_to_count = []
-        for sampleName, sample in self._samples.items():
-          if 'EventsPerJob' in sample:
-            for subname, list_root_files in sample['name'].items():
-              all_files_to_count.extend(list_root_files)
-
-        nevents_map = {}
-        if all_files_to_count:
-          print(f"\n  -> Pre-counting events for {len(all_files_to_count)} files...")
-          nevents_map = self._count_events(all_files_to_count, tree_name="Events")
-          print(f"  -> Event counting done.\n")
-
-        for sampleName, sample in self._samples.items():
-          os.makedirs(os.path.join(self._script_batch_location, sampleName), exist_ok=True)
+          os.system ("mkdir " + self._script_batch_location + "/" + sampleName + "/")
 
           for subname, list_root_files in sample['name'].items():
-            os.makedirs(os.path.join(self._script_batch_location, sampleName, subname), exist_ok=True)
+            os.system ("mkdir " + self._script_batch_location + "/" + sampleName + "/" + subname + "/")
 
-            if not self._silentMode:
-              os.makedirs(os.path.join(self._script_batch_location, sampleName, subname, "log"), exist_ok=True)
+            make_job_every_N = 1
+            if "FilesPerJob" in sample.keys():
+              make_job_every_N = sample['FilesPerJob']
+            chunks_list_root_files = [list_root_files[i:i + make_job_every_N] for i in range(0, len(list_root_files), make_job_every_N)]
 
-            tree = "Events"
-            if 'EventsPerJob' in sample:
-              chunks = self._make_event_chunks(list_root_files, sample['EventsPerJob'], nevents_map)
-            else:
-              make_job_every_N = sample.get('FilesPerJob', 1)
-              chunks = [{'files': list_root_files[i:i + make_job_every_N], 'range_start': None, 'range_end': None, 'nevents': None}
-                        for i in range(0, len(list_root_files), make_job_every_N)]
-
-            for i, chunk in enumerate(chunks):
-              job_name              = "my_snapshot_" + sampleName + "_" + subname + "_" + str(i)
-              name_bash             = os.path.join(self._script_batch_location, sampleName, subname, job_name + ".sh")
+            for i, root_files in enumerate(chunks_list_root_files):
+              name_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/" + "my_snapshot_" + sampleName + "_" + subname + "_" + str(i)
+              name_code_no_folder = "my_snapshot_" + sampleName + "_" + subname + "_" + str(i)
+              name_bash = self._script_batch_location + "/" + sampleName + "/" + subname + "/" + "my_script_" + str(i) + ".sh"
               output_root_file_name = "nanoLatino_snapshot____" + sampleName + "_" + subname + "_" + str(i) + ".root"
-              name_folder_code      = os.path.join(self._scripts_run_folder, sampleName, subname)
-              abs_executable        = os.path.join(name_folder_code, job_name)
-              abs_cpp               = os.path.join(name_folder_code, job_name + ".cpp")
 
-              if precompiled:
-                bash_code = f"""#!/bin/bash
-set -e
+              bash_code = f"""#!/bin/bash
+set -e  # Exit on error
 echo "Job started at $(date)"
 echo "Running on node $(hostname)"
-source /cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh
-{proxy_lines}mkdir -p {self._folder_where_to_save_trees}
-./{job_name}
-mv {output_root_file_name} {self._folder_where_to_save_trees}/
-echo "Done at $(date)"
+echo "Current full path before running the snapshot: $(pwd)"
+./{name_code_no_folder}
+echo "Current full path after running the snapshot: $(pwd)"
+mv {output_root_file_name}  {self._folder_where_to_save_trees}/
+echo "Current full path after moving the files: $(pwd)"
+echo "Current directory content after running:"
 ls -lh
-"""
-                job_exe = abs_executable
+echo "Current full path: $(pwd)"
 
-              else:
-                bash_code = f"""#!/bin/bash
-set -e
-echo "Job started at $(date)"
-echo "Running on node $(hostname)"
-source /cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh
-{proxy_lines}echo "Compiling snapshot executable..."
-g++ -O2 -Wall {root_cflags} \\
-    {job_name}.cpp -o {job_name} \\
-    -lTMVA -lXMLIO \\
-    -I/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/include \\
-    -L/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/lib \\
-    -lcorrectionlib {root_libs}
-echo "Compilation done at $(date)"
-mkdir -p {self._folder_where_to_save_trees}
-./{job_name}
-mv {output_root_file_name} {self._folder_where_to_save_trees}/
-echo "Done at $(date)"
-ls -lh
 """
-                job_exe = abs_cpp
 
-              with open(name_bash, "w") as f:
+#
+# mkdir {self._folder_where_to_save_trees}
+#
+
+              with open(f"{name_bash}", "w") as f:
                 f.write(bash_code)
-              os.system("chmod +x " + name_bash)
+                os.system ("chmod +x " + name_bash)
+                # print ("name_bash = ", name_bash)
 
-              name_folder = os.path.join(self._script_batch_location, sampleName, subname)
+              name_submit = submission_dir + "/" + self._script_batch_location + "/" + sampleName + "/" + subname + "/" + "my_script_" + str(i) + ".sub"
+              # name_folder = submission_dir + "/" + self._script_batch_location + "/" + sampleName + "/" + subname + "/"
+              name_folder = self._script_batch_location + "/" + sampleName + "/" + subname + "/"
+              name_folder_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/"
+              name_bash_no_folder = "my_script_" + str(i) + ".sh"
 
-              if self._silentMode:
+              if self._silentMode :
                 output_file = "/dev/null"
                 error_file  = "/dev/null"
                 log_file    = "/dev/null"
-              else:
-                log_dir     = os.path.join(name_folder, "log")
-                output_file = os.path.join(log_dir, job_name + ".sh.out")
-                error_file  = os.path.join(log_dir, job_name + ".sh.err")
-                log_file    = os.path.join(log_dir, job_name + ".sh.log")
+              else :
+                output_file = f"log/{name_bash_no_folder}.out"
+                error_file  = f"log/{name_bash_no_folder}.err"
+                log_file    = f"log/{name_bash_no_folder}.log"
 
-              queue_rows.append((name_bash, job_exe, output_file, error_file, log_file))
 
-        # single submit file
-        global_submit_path = os.path.join(self._script_batch_location, "submit_all.sub")
+              submit_code = f"""
+initialdir            = {name_folder}
+executable            = {name_bash}
+transfer_input_files  = {submission_dir}/{name_folder_code}{name_code_no_folder}
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT
+output                = {output_file}
+error                 = {error_file}
+log                   = {log_file}
+getenv                = True
++JobFlavour           = "longlunch"
+queue
+"""
 
-        extra_files = getattr(self, '_extra_transfer_files', [])
-        extra_files_str = (", " + ", ".join(extra_files)) if extra_files else ""
+              with open(f"{name_submit}", "w") as f:
+                f.write(submit_code)
 
-        fixed_extra = f"{x509_proxy}{extra_files_str}"
+              print("Submitting job to HTCondor: condor_submit " + name_submit)
+              subprocess.run(["condor_submit", f"{name_submit}"])
 
-        queue_lines = "\n".join(
-            f"  {exe}, {job_exe}, {out}, {err}, {log}"
-            for exe, job_exe, out, err, log in queue_rows
-        )
-
-        submit_code = (
-            "# Auto-generated by mkSnapshot.py\n"
-            f"# Mode: {'pre-compiled' if precompiled else 'compile-on-node'}\n"
-            "\n"
-            "should_transfer_files   = YES\n"
-            "when_to_transfer_output = ON_EXIT\n"
-            f"transfer_input_files    = $(job_exe), {fixed_extra}\n"
-            "getenv                  = True\n"
-            "+JobFlavour             = \"longlunch\"\n"
-            "\n"
-            "queue executable, job_exe, output, error, log from (\n"
-            + queue_lines + "\n"
-            ")\n"
-        )
-
-        with open(global_submit_path, "w") as f:
-            f.write(submit_code)
-
-        print(f"Created: {global_submit_path}  ({len(queue_rows)} jobs)")
-        print("Submitting all jobs with a single condor_submit ...")
-        subprocess.run(["condor_submit", global_submit_path],
-                       cwd=self._script_batch_location)
 
 
 
@@ -929,18 +729,16 @@ if __name__ == '__main__':
          '          |  |   |  (   |  |   | \\__ \\  | | |  (   |  |        |   |  (   |    <    __/  |      '
          '    _____/  _|  _| \\__,_|  .__/  ____/ _| |_| \\___/  \\__|     _|  _| \\__,_| _|\\_\\ \\___| _|      '
          '                          _|                                                                    '
-         '          --------------------------------------------------------------------------------------------------
+         '                                                                                                '
+         --------------------------------------------------------------------------------------------------
          """
 
     print(header)
 
     parser = defaultParser()
 
-    # [MODIFIED] added --localCompile, aligned with mkShapes
-    parser.add_argument("--localCompile",  action='store_true', dest="localCompile",   help="Compile locally with: make -f MakefileSnapshot -j8")
-    parser.add_argument("--submitBatch",   action='store_true', dest="submitBatch",    help="Trigger the submission to lxbatch")
-    parser.add_argument("--checkBatch",    action='store_true', dest="checkBatch",     help="Check if jobs are done succesfully")
-    parser.add_argument("--silentMode",    action='store_true', dest="silentMode",     help="Remove as much as possible the print and the log/err files production")
+    parser.add_argument("--submitBatch", action='store_true', dest="submitBatch",   help="Trigger the submission to lxbatch")
+    parser.add_argument("--checkBatch",  action='store_true', dest="checkBatch",    help="Check if jobs are done succesfully")
 
 
     opt = parser.parse_args()
@@ -949,10 +747,8 @@ if __name__ == '__main__':
     opt = parser.parse_args()
 
 
-    print ("opt.localCompile     = ", opt.localCompile)
     print ("opt.submitBatch      = ", opt.submitBatch)
     print ("opt.checkBatch       = ", opt.checkBatch)
-    print ("opt.silentMode       = ", opt.silentMode)
 
 
     variables_to_dump = []
@@ -1045,44 +841,23 @@ if __name__ == '__main__':
     print ("folder_where_to_save_trees = ", folder_where_to_save_trees)
 
 
-    # [MODIFIED] read batchScriptLocation and snapshotRunFolder from configuration.py if present
-    batch_script_location = './scripts_snapshot_batch/'
-    if hasattr(opt, 'batchScriptLocation'):
-      batch_script_location = opt.batchScriptLocation
-
-    scripts_run_folder = None
-    if hasattr(opt, 'snapshotRunFolder'):
-      scripts_run_folder = opt.snapshotRunFolder
-
-    print ("batch_script_location = ", batch_script_location)
-    print ("scripts_run_folder    = ", scripts_run_folder)
 
 
     factory = SnapshotFactory()
-    factory.setValues(variables, cuts, supercut, samples, aliases,
-                      variables_to_dump, cut_to_dump, folder_where_to_save_trees,
-                      batch_script_location,
-                      scripts_run_folder)
-    factory.setConditions(opt.silentMode)
+    factory.setValues( variables, cuts, supercut, samples , aliases, variables_to_dump, cut_to_dump, folder_where_to_save_trees)
 
-    # [MODIFIED] workflow aligned with mkShapes:
-    #   (default)       -> makeScripts only (generate .cpp + Makefile, no compile)
-    #   --localCompile  -> make -f MakefileSnapshot -j8
-    #   --submitBatch   -> submit compiled executables to HTCondor (single submit file)
-    #   --checkBatch    -> check job outputs and missing files
+    # factory._treeName  = opt.treeName
+    # factory._energy    = opt.energy
+    # factory._lumi      = opt.lumi
+    # factory._tag       = opt.tag
 
-    if not opt.submitBatch and not opt.checkBatch and not opt.localCompile:
+    if not opt.submitBatch and not opt.checkBatch:
       factory.makeScripts()
 
-    if opt.localCompile:
-      factory.makeScripts()
-      print("Compiling with: make -f MakefileSnapshot -j8")
-      subprocess.run(["make", "-f", "MakefileSnapshot", "-j8"])
-
-    if opt.submitBatch:
+    if opt.submitBatch :
       factory.submitBatch()
 
-    if opt.checkBatch:
+    if opt.checkBatch :
       print ("Checking if the jobs finished succesfully")
       factory.checkBatch()
 
