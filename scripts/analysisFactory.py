@@ -136,7 +136,7 @@ class AnalysisFactory:
       - weights
       - supercut
       - cuts / categories
-      - FilesPerJob chunking
+      - EventsPerJob / FilesPerJob chunking with parallel event counting + JSON cache
       - submitBatch (proxy check, precompiled vs compile-on-node, single .sub file)
       - checkBatch + --resubmit
       - parallelCompile
@@ -209,11 +209,143 @@ class AnalysisFactory:
             result.setdefault(subname, []).extend(files)
         return result
 
+    # _____________________________________________________________________________
+    #  Event counting + cache
+    # _____________________________________________________________________________
+
+    @staticmethod
+    def _get_nevents(file_path, tree_name="Events"):
+        try:
+            f = ROOT.TFile.Open(file_path)
+            if not f or f.IsZombie():
+                print(f"  WARNING: cannot open {file_path}, assuming 0 events")
+                return 0
+            t = f.Get(tree_name)
+            if not t:
+                print(f"  WARNING: tree '{tree_name}' not found in {file_path}, assuming 0 events")
+                f.Close()
+                return 0
+            n = t.GetEntries()
+            f.Close()
+            return n
+        except Exception as e:
+            print(f"  WARNING: exception reading {file_path}: {e}")
+            return 0
+
+    @staticmethod
+    def _get_nevents_worker(args):
+        """Multiprocessing worker: returns (file_path, mtime, nevents)."""
+        file_path, tree_name = args
+        try:
+            mtime = os.path.getmtime(file_path)
+        except Exception:
+            mtime = 0
+        n = AnalysisFactory._get_nevents(file_path, tree_name)
+        return file_path, mtime, n
+
+    def _events_cache_path(self):
+        # samples_metadata.json lives next to configuration.py (cwd), not with rootfiles
+        return os.path.join(os.getcwd(), "samples_metadata.json")
+
+    def _load_events_cache(self):
+        import json
+        cache_path = self._events_cache_path()
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'r') as f:
+                    return json.load(f), cache_path
+            except Exception:
+                pass
+        return {}, cache_path
+
+    def _save_events_cache(self, cache, cache_path):
+        import json
+        with open(cache_path, 'w') as f:
+            json.dump(cache, f, indent=2)
+
+    def _count_events(self, all_files, tree_name="Events", n_workers=8):
+        import multiprocessing
+        cache, cache_path = self._load_events_cache()
+        results  = {}
+        to_count = []
+        for fp in all_files:
+            try:
+                mtime = os.path.getmtime(fp)
+            except Exception:
+                mtime = 0
+            entry = cache.get(fp)
+            if entry and abs(entry.get('mtime', -1) - mtime) < 1.0:
+                results[fp] = entry['nevents']
+            else:
+                to_count.append(fp)
+        if to_count:
+            print(f"  -> Counting events in {len(to_count)} files ({len(results)} from cache) using {n_workers} workers...")
+            with multiprocessing.Pool(processes=n_workers) as pool:
+                counted = pool.map(AnalysisFactory._get_nevents_worker,
+                                   [(fp, tree_name) for fp in to_count])
+            for fp, mtime, n in counted:
+                results[fp] = n
+                cache[fp]   = {'mtime': mtime, 'nevents': n}
+                print(f"    {fp}  ->  {n} events")
+            self._save_events_cache(cache, cache_path)
+            print(f"  -> Cache saved: {cache_path}")
+        else:
+            print(f"  -> All {len(results)} files found in cache, skipping event counting.")
+        return results
+
+    @staticmethod
+    def _make_event_chunks(list_root_files, events_per_job, nevents_map):
+        chunks = []
+        current_files  = []
+        current_events = 0
+        for file_path in list_root_files:
+            n = nevents_map.get(file_path, 0)
+            if n == 0:
+                continue
+            if n > events_per_job:
+                if current_files:
+                    chunks.append({'files': current_files, 'range_start': None, 'range_end': None, 'nevents': current_events})
+                    current_files  = []
+                    current_events = 0
+                start = 0
+                while start < n:
+                    end = min(start + events_per_job, n)
+                    chunks.append({'files': [file_path], 'range_start': start, 'range_end': end, 'nevents': end - start})
+                    start = end
+            else:
+                if current_events + n > events_per_job and current_files:
+                    chunks.append({'files': current_files, 'range_start': None, 'range_end': None, 'nevents': current_events})
+                    current_files  = []
+                    current_events = 0
+                current_files.append(file_path)
+                current_events += n
+        if current_files:
+            chunks.append({'files': current_files, 'range_start': None, 'range_end': None, 'nevents': current_events})
+        return chunks
+
     def _get_chunks(self, sample, list_root_files, tree="Events"):
-        """Return list of chunks for a sample, using FilesPerJob."""
+        """Return list of chunks for a sample, using EventsPerJob or FilesPerJob."""
+        if 'EventsPerJob' in sample:
+            return self._make_event_chunks(list_root_files, sample['EventsPerJob'],
+                                           getattr(self, '_nevents_map', {}))
         make_job_every_N = sample.get('FilesPerJob', 1)
-        return [{'files': list_root_files[i:i + make_job_every_N]}
+        return [{'files': list_root_files[i:i + make_job_every_N],
+                 'range_start': None, 'range_end': None, 'nevents': None}
                 for i in range(0, len(list_root_files), make_job_every_N)]
+
+    def _pre_count_events(self):
+        """Pre-count events for all samples that use EventsPerJob."""
+        all_files = []
+        for sampleName, sample in self._samples.items():
+            if 'EventsPerJob' in sample:
+                for subname, list_root_files in self._normalize_sample_name(sample['name']).items():
+                    all_files.extend(list_root_files)
+        if all_files:
+            print(f"\n  -> Pre-counting events for {len(all_files)} files...")
+            self._nevents_map = self._count_events(all_files)
+            print(f"  -> Event counting done.\n")
+        else:
+            self._nevents_map = {}
 
     # _____________________________________________________________________________
     #  C++ code generation — shared parts
@@ -236,7 +368,7 @@ class AnalysisFactory:
         return aliases_to_be_defined, functions_to_be_defined, aliases_ordered
 
     def _build_cpp_common(self, tree_name, file_path, sampleName, weight,
-                          aliases_ordered):
+                          aliases_ordered, range_start=None, range_end=None):
         """
         Returns a dict of C++ fragments shared between mkShapes and mkSnapshot:
           code_of_function_to_include, lines_to_add, lines_to_global, lines_to_process,
@@ -338,6 +470,9 @@ class AnalysisFactory:
         # ---- booking_logic ----
         booking_logic = "//  Initial ...\n"
         booking_logic += f'    auto current_node = ROOT::RDF::RNode(varied_df);\n'
+        if range_start is not None and range_end is not None:
+            booking_logic += f'    current_node = ROOT::RDF::RNode(current_node.Range({range_start}, {range_end}));\n'
+            booking_logic += f'    std::cout << "   Range: [{range_start}, {range_end})" << std::endl;\n'
 
         # ---- define variables and cuts ----
         define_variables_logic = "//  Define variables\n"
@@ -460,6 +595,8 @@ class AnalysisFactory:
         x509_proxy, proxy_lines = self._check_proxy()
         if x509_proxy is None:
             return
+
+        self._pre_count_events()
 
         queue_rows = []
 

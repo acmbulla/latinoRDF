@@ -352,10 +352,10 @@ std::vector<std::string> getBranchNames(TTree* tree) {
                                          output_root_file_name, sampleName, weight,
                                          aliases_to_be_defined, functions_to_be_defined,
                                          subsamples, aliases_ordered=None,
-):
+                                         range_start=None, range_end=None):
         self._current_subsamples = subsamples
         frags = self._build_cpp_common(tree_name, file_path, sampleName, weight,
-                                       aliases_ordered or {})
+                                       aliases_ordered or {}, range_start, range_end)
 
         # The big C++ template — same as the original mkShapes
         cpp_code = f"""
@@ -573,6 +573,8 @@ int main() {{
         os.makedirs(self._scripts_run_folder, exist_ok=True)
         self.create_library_cpp()
 
+        self._pre_count_events()
+
         list_of_files_to_compile = []
         list_of_files_divided    = {}
 
@@ -605,7 +607,8 @@ int main() {{
 
                     self.create_cpp_source_list_of_files(
                         name_code, "Events", chunk['files'], out_file, sampleName, weight,
-                        {}, {}, subsamples_dict, aliases_ordered)
+                        {}, {}, subsamples_dict, aliases_ordered,
+                        range_start=chunk['range_start'], range_end=chunk['range_end'])
 
                     list_of_files_to_compile.append(name_code)
                     list_of_files_divided[sampleName].append(name_code)

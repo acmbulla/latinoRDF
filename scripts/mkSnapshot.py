@@ -189,11 +189,12 @@ class SnapshotFactory(AnalysisFactory):
                                          output_root_file_name, sampleName, weight,
                                          aliases_to_be_defined, functions_to_be_defined,
                                          aliases_ordered=None,
+                                         range_start=None, range_end=None,
                                          extra_weight_defines=""):
         frags = self._build_cpp_common(tree_name, file_path, sampleName, weight,
-                                       aliases_ordered or {})
+                                       aliases_ordered or {}, range_start, range_end)
 
-        mt_setting = "ROOT::EnableImplicitMT();"
+        mt_setting = "ROOT::DisableImplicitMT();" if (range_start is not None and range_end is not None) else "ROOT::EnableImplicitMT();"
 
         snapshot_call = f'node_{self._cut_to_dump}.Snapshot("Events", "{output_root_file_name}", columns_to_save);\n'
 
@@ -279,6 +280,8 @@ int main() {{
         os.makedirs(self._folder_where_to_save_trees, exist_ok=True)
         os.makedirs(self._scripts_run_folder, exist_ok=True)
 
+        self._pre_count_events()
+
         list_of_files_to_compile = []
 
         for sampleName, sample in self._samples.items():
@@ -321,6 +324,7 @@ int main() {{
                         out_file,
                         sampleName, weight,
                         {}, {}, aliases_ordered=aliases_ordered,
+                        range_start=chunk.get('range_start'), range_end=chunk.get('range_end'),
                         extra_weight_defines=extra_weight_defines)
 
                     list_of_files_to_compile.append(name_code + ".cpp")
@@ -346,6 +350,8 @@ int main() {{
 
         os.makedirs(self._folder_where_to_save_trees, exist_ok=True)
         os.makedirs(self._scripts_run_folder, exist_ok=True)
+
+        self._pre_count_events()
 
         list_of_files_to_compile = []
 
@@ -399,7 +405,9 @@ int main() {{
                             self.create_cpp_source_list_of_files(
                                 name_code, "Events", alt_files, out_file,
                                 sampleName, weight,
-                                {}, {}, aliases_ordered=aliases_ordered)
+                                {}, {}, aliases_ordered=aliases_ordered,
+                                range_start=chunk.get('range_start'),
+                                range_end=chunk.get('range_end'))
 
                             list_of_files_to_compile.append(name_code + ".cpp")
 
