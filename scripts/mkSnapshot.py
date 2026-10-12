@@ -41,6 +41,88 @@ def _collect_cut_variables(cuts):
     return vars_used
 
 
+def _collect_alias_dependencies(aliases_ordered):
+    """Collect all input variables needed by aliases."""
+    deps = {}
+    for aliasName, (kind, payload) in aliases_ordered.items():
+        if kind == 'expr':
+            deps[aliasName] = _extract_branch_names(payload)
+        elif kind == 'function' and 'variables' in payload:
+            deps[aliasName] = list(payload['variables'])
+    return deps
+
+
+# -----------------------------------------------------------------------
+#  SnapshotMetadata
+# -----------------------------------------------------------------------
+
+class SnapshotMetadata:
+    """
+    Tracks what has been saved in the snapshot and what still needs to be done.
+    Saved as snapshot_metadata.json in folder_where_to_save_trees.
+    """
+
+    def __init__(self, path):
+        self._path = path
+        self._data = {
+            'cut_to_dump'        : '',
+            'cut_expression'     : '',
+            'cut_variables'      : [],
+            'variables_saved'    : [],
+            'alias_dependencies' : {},
+            'weight_nuisances'   : [],
+            'shape_nuisances'    : [],
+            'patches'            : [],
+            'completed_files'    : {},
+        }
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                self._data.update(json.load(f))
+
+    def save(self):
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        with open(self._path, 'w') as f:
+            json.dump(self._data, f, indent=2)
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def set(self, key, value):
+        self._data[key] = value
+
+    def mark_completed(self, job_key, path):
+        try:
+            mtime = os.path.getmtime(path)
+        except Exception:
+            mtime = 0
+        self._data['completed_files'][job_key] = {'path': path, 'mtime': mtime}
+
+    def is_completed(self, job_key, path):
+        entry = self._data['completed_files'].get(job_key)
+        if not entry:
+            return False
+        if not os.path.exists(path):
+            return False
+        try:
+            mtime = os.path.getmtime(path)
+            return abs(mtime - entry.get('mtime', -1)) < 2.0
+        except Exception:
+            return False
+
+    def missing_variables(self, requested):
+        saved = set(self._data.get('variables_saved', []))
+        return [v for v in requested if v not in saved]
+
+    def can_patch_from_snapshot(self, missing_vars):
+        """Check if missing variables can be derived from already-saved branches."""
+        saved = set(self._data.get('variables_saved', []))
+        alias_deps = self._data.get('alias_dependencies', {})
+        for var in missing_vars:
+            deps = alias_deps.get(var, [var])
+            if not all(d in saved for d in deps):
+                return False
+        return True
+
 
 # -----------------------------------------------------------------------
 #  SnapshotFactory
@@ -56,6 +138,7 @@ class SnapshotFactory(AnalysisFactory):
         self._folder_where_to_save_trees = ''
         self._scripts_run_folder         = 'scripts_snapshot_run'
         self._script_batch_location      = './scripts_snapshot_batch/'
+        self._metadata                   = None
 
     # _____________________________________________________________________________
     def setSnapshotValues(self, variables_to_dump, cut_to_dump, folder_where_to_save_trees):
@@ -63,6 +146,8 @@ class SnapshotFactory(AnalysisFactory):
         self._cut_to_dump                = cut_to_dump
         self._folder_where_to_save_trees = os.path.abspath(
             os.path.expandvars(folder_where_to_save_trees))
+        meta_path = os.path.join(self._folder_where_to_save_trees, 'snapshot_metadata.json')
+        self._metadata = SnapshotMetadata(meta_path)
 
     # _____________________________________________________________________________
     def job_prefix(self):
@@ -275,8 +360,11 @@ int main() {{
     #  makeScripts — nominal run
     # _____________________________________________________________________________
 
-    def makeScripts(self):
+    def makeScripts(self, patch_mode=False, force=False):
         print("=====================\n==== makeScripts ====\n=====================")
+        if patch_mode:
+            print("  -> PATCH MODE: adding missing variables to existing snapshots")
+
         os.makedirs(self._folder_where_to_save_trees, exist_ok=True)
         os.makedirs(self._scripts_run_folder, exist_ok=True)
 
@@ -314,20 +402,65 @@ int main() {{
                 print(f"  -> {len(chunks)} jobs")
 
                 for i, chunk in enumerate(chunks):
+                    job_key  = f"{sampleName}_{subname}_{i}"
                     out_file = self.output_file_name(sampleName, subname, i)
+                    out_path = os.path.join(self._folder_where_to_save_trees, out_file)
+
+                    if not force and not patch_mode and self._metadata.is_completed(job_key, out_path):
+                        print(f"    -> {job_key} already done, skipping")
+                        continue
 
                     name_code = (self._scripts_run_folder + "/" + sampleName + "/" + subname
                                  + "/" + self.job_prefix() + "_" + sampleName + "_" + subname + "_" + str(i))
 
+                    if patch_mode:
+                        # determine missing variables
+                        missing = self._metadata.missing_variables(full_vtd)
+                        if not missing:
+                            print(f"    -> {job_key} nothing to patch")
+                            continue
+                        # can we patch from snapshot or need nanoAOD?
+                        if self._metadata.can_patch_from_snapshot(missing):
+                            print(f"    -> {job_key} patch from snapshot ({len(missing)} new vars)")
+                            input_files = [out_path]  # read existing snapshot
+                            patch_suffix = f"_patch{len(self._metadata.get('patches', []))}"
+                            patch_out    = self.output_file_name(sampleName, subname, i).replace('.root', f'{patch_suffix}.root')
+                            self._current_variables_to_dump = missing
+                        else:
+                            print(f"    -> {job_key} patch requires nanoAOD (missing deps)")
+                            input_files = chunk['files']
+                            patch_out   = out_file
+                    else:
+                        input_files = chunk['files']
+                        patch_out   = out_file
+
                     self.create_cpp_source_list_of_files(
-                        name_code, "Events", chunk['files'],
-                        out_file,
+                        name_code, "Events", input_files,
+                        patch_out if patch_mode else out_file,
                         sampleName, weight,
                         {}, {}, aliases_ordered=aliases_ordered,
                         range_start=chunk.get('range_start'), range_end=chunk.get('range_end'),
                         extra_weight_defines=extra_weight_defines)
 
                     list_of_files_to_compile.append(name_code + ".cpp")
+
+        # update metadata
+        self._metadata.set('cut_to_dump',     self._cut_to_dump)
+        self._metadata.set('cut_expression',  self._cuts.get(self._cut_to_dump, ''))
+        self._metadata.set('cut_variables',   list(_collect_cut_variables(self._cuts)))
+        self._metadata.set('variables_saved', self._current_variables_to_dump)
+        self._metadata.set('alias_dependencies',
+                           _collect_alias_dependencies(aliases_ordered if 'aliases_ordered' in dir() else {}))
+        # track weight nuisances
+        wn = [n for n, nu in self._nuisances.items()
+              if nu.get('type') == 'shape' and nu.get('kind') == 'weight']
+        self._metadata.set('weight_nuisances', wn)
+        # track shape nuisances
+        sn = [n for n, nu in self._nuisances.items()
+              if nu.get('type') == 'shape' and nu.get('kind') in ('suffix', 'suffixFly')]
+        self._metadata.set('shape_nuisances', sn)
+        self._metadata.save()
+        print(f"  -> Metadata saved: {self._metadata._path}")
 
         self.generate_makefile(list_of_files_to_compile)
         subprocess.run(["make", "-f", "MakefileSnapshot", "clean"])
@@ -411,6 +544,12 @@ int main() {{
 
                             list_of_files_to_compile.append(name_code + ".cpp")
 
+        # update metadata
+        sn = [n for n, nu in self._nuisances.items()
+              if nu.get('type') == 'shape' and nu.get('kind') in ('suffix', 'suffixFly')]
+        self._metadata.set('shape_nuisances', sn)
+        self._metadata.save()
+
         self.generate_makefile(list_of_files_to_compile, "MakefileSnapshotNuisances")
         print("Scripts generated. To compile: make -f MakefileSnapshotNuisances -j8")
 
@@ -479,6 +618,29 @@ echo "Done at $(date)"; ls -lh
         return os.path.join(self._folder_where_to_save_trees,
                             f"nanoLatino_snapshot____{suffix}.root")
 
+    def checkBatch(self, resubmit=False):
+        """Override to also mark completed jobs in metadata."""
+        super().checkBatch(resubmit=resubmit)
+        # update metadata with completed files
+        for sampleName in self._samples:
+            sample_dir = os.path.join(self._script_batch_location, sampleName)
+            if not os.path.isdir(sample_dir):
+                continue
+            for subname in os.listdir(sample_dir):
+                subname_dir = os.path.join(sample_dir, subname)
+                if not os.path.isdir(subname_dir):
+                    continue
+                sh_files = sorted(f for f in os.listdir(subname_dir) if f.endswith('.sh'))
+                for sh_file in sh_files:
+                    job_name = sh_file[:-3]
+                    suffix   = job_name.replace(self.job_prefix() + "_", "", 1)
+                    out_path = os.path.join(self._folder_where_to_save_trees,
+                                            f"nanoLatino_snapshot____{suffix}.root")
+                    job_key  = suffix
+                    if os.path.exists(out_path):
+                        self._metadata.mark_completed(job_key, out_path)
+        self._metadata.save()
+
 
 # -----------------------------------------------------------------------
 #  Main
@@ -505,8 +667,12 @@ if __name__ == '__main__':
     parser.add_argument("--silentMode",      action='store_true', dest="silentMode")
     parser.add_argument("--haddBatch",       action='store_true', dest="haddBatch",
                         help="Submit a single condor job to hadd all snapshot files")
+    parser.add_argument("--patch",           action='store_true', dest="patch",
+                        help="Add missing variables to existing snapshots")
     parser.add_argument("--shapeNuisances",  action='store_true', dest="shapeNuisances",
                         help="Generate alternative TTree files for shape nuisances")
+    parser.add_argument("--force",           action='store_true', dest="force",
+                        help="Force regeneration even if already done")
 
     opt = parser.parse_args()
     loadDefaultOptions(parser, opt.pycfg)
@@ -546,14 +712,17 @@ if __name__ == '__main__':
     factory.setConditions(opt.silentMode)
 
     if not any([opt.submitBatch, opt.checkBatch, opt.localCompile,
-                opt.shapeNuisances, opt.haddBatch]):
-        factory.makeScripts()
+                opt.patch, opt.shapeNuisances, opt.haddBatch]):
+        factory.makeScripts(force=opt.force)
+
+    if opt.patch:
+        factory.makeScripts(patch_mode=True, force=opt.force)
 
     if opt.shapeNuisances:
         factory.makeShapeNuisances()
 
     if opt.localCompile:
-        factory.makeScripts()
+        factory.makeScripts(force=opt.force)
         subprocess.run(["make", "-f", "MakefileSnapshot", "-j8"])
 
     if opt.submitBatch:
