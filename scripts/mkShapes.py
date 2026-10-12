@@ -614,6 +614,26 @@ int main() {{
         print("Do not compile ... If you want to compile run the compilation by hand!")
         subprocess.run(["make", "clean"])
 
+    # _____________________________________________________________________________
+    #  haddBatch — submit a single condor job to hadd all root files
+    # _____________________________________________________________________________
+
+    def haddBatch(self, tag, haddfast_path=None):
+        if haddfast_path is None:
+            haddfast_path = os.path.join(_SCRIPTS_DIR, "haddfast.py")
+        super().haddBatch(
+            tag          = tag,
+            output_dir   = self._outputDir,
+            glob_pattern = "root_file___*.root",
+            output_name  = f"plots_{tag}.root",
+            hadd_tool_path = haddfast_path,
+            hadd_tool_args = "-f -j 8 -E",
+        )
+
+    # _____________________________________________________________________________
+    #  submitBatch hooks
+    # _____________________________________________________________________________
+
     def _prepare_submit_batch(self, root_cflags, root_libs):
         """Compile liblibrary_utils.so locally if missing."""
         abs_library = os.path.join(self._scripts_run_folder, "liblibrary_utils.so")
@@ -697,6 +717,8 @@ if __name__ == '__main__':
     parser.add_argument("--localCompile",    action='store_true', dest="localCompile")
     parser.add_argument("--submitBatch",     action='store_true', dest="submitBatch")
     parser.add_argument("--hadd",            action='store_true', dest="haddRootFiles")
+    parser.add_argument("--haddBatch",       action='store_true', dest="haddBatch",
+                        help="Submit a single condor job to hadd all root files")
     parser.add_argument("--checkBatch",      action='store_true', dest="checkBatch")
     parser.add_argument("--resubmit",        action='store_true', dest="resubmit")
     parser.add_argument("--silentMode",      action='store_true', dest="silentMode")
@@ -722,7 +744,7 @@ if __name__ == '__main__':
     )
     factory.setConditions(opt.silentMode)
 
-    if not any([opt.submitBatch, opt.haddRootFiles, opt.checkBatch,
+    if not any([opt.submitBatch, opt.haddRootFiles, opt.haddBatch, opt.checkBatch,
                 opt.localCompile, opt.parallelCompile]):
         factory.makeNominals()
 
@@ -732,9 +754,21 @@ if __name__ == '__main__':
         factory.parallelCompile()
     if opt.submitBatch:
         factory.submitBatch()
+    if opt.haddBatch:
+        tag = getattr(opt, 'tag', 'merged')
+        haddfast_path = getattr(opt, 'haddfastPath', None)
+        factory.haddBatch(tag, haddfast_path=haddfast_path)
+
     if opt.haddRootFiles:
-        hadd_cmd = f"hadd -j 8 -f {opt.outputDir}/root_file_joined.root {opt.outputDir}/root_file___*.root"
-        os.system(hadd_cmd)
+        all_done, missing = factory._check_all_done()
+        if not all_done:
+            print(f"ERROR: {len(missing)} output files missing — cannot hadd incomplete results.")
+            for f in missing:
+                print(f"  {f}")
+            print("Run --checkBatch to get the full picture, --resubmit to resubmit missing jobs.")
+        else:
+            hadd_cmd = f"hadd -j 8 -f {opt.outputDir}/root_file_joined.root {opt.outputDir}/root_file___*.root"
+            os.system(hadd_cmd)
     if opt.checkBatch:
         factory.checkBatch(resubmit=opt.resubmit)
 

@@ -723,6 +723,149 @@ class AnalysisFactory:
         raise NotImplementedError
 
     # _____________________________________________________________________________
+    #  haddBatch — shared, submit a single condor job to hadd all output files
+    # _____________________________________________________________________________
+
+    def _check_all_done(self):
+        """
+        Silent check: returns (all_done, missing_list).
+        Does not print a table — just counts missing files.
+        """
+        missing = []
+        for sampleName in self._samples:
+            sample_batch_dir = os.path.join(self._script_batch_location, sampleName)
+            if not os.path.isdir(sample_batch_dir):
+                continue
+            for subname in os.listdir(sample_batch_dir):
+                subname_dir = os.path.join(sample_batch_dir, subname)
+                if not os.path.isdir(subname_dir):
+                    continue
+                sh_files = sorted(f for f in os.listdir(subname_dir) if f.endswith('.sh'))
+                for sh_file in sh_files:
+                    job_name = sh_file[:-3]
+                    suffix   = job_name.replace(self.job_prefix() + "_", "", 1)
+                    _out     = self._output_file_from_suffix(sampleName, subname, suffix)
+                    root_file = _out if os.path.isabs(_out) else os.path.join(self._outputDir, _out)
+                    if not os.path.exists(root_file):
+                        missing.append(root_file)
+        return len(missing) == 0, missing
+
+    def haddBatch(self, tag, output_dir, glob_pattern, output_name,
+                  hadd_tool_path, hadd_tool_args="-f -j 8 -E"):
+        """
+        Submit a single condor job that hadd all files matching glob_pattern in output_dir.
+        hadd_tool_path: path to haddfast.py or haddnano.py
+        hadd_tool_args: extra args to pass to the tool
+        """
+        import glob as _glob
+        import re as _re
+
+        submission_dir = os.getcwd()
+
+        # silent pre-check: abort if any output files are missing
+        all_done, missing = self._check_all_done()
+        if not all_done:
+            print(f"ERROR: {len(missing)} output files missing — cannot hadd incomplete results.")
+            print("Missing files:")
+            for f in missing:
+                print(f"  {f}")
+            print("Run --checkBatch to get the full picture, --resubmit to resubmit missing jobs.")
+            return
+        print(f"  -> All jobs done, proceeding with hadd ({len(missing)} missing = 0)")
+
+        x509_proxy, proxy_lines = self._check_proxy()
+        if x509_proxy is None:
+            return
+
+        # resolve absolute output_dir
+        if not os.path.isabs(output_dir):
+            output_dir = os.path.join(submission_dir, output_dir)
+        output_dir_normalized = _re.sub(r'^/eos/home-([a-z])/',
+                                         lambda m: f"/eos/user/{m.group(1)}/", output_dir)
+
+        # find all files matching pattern
+        all_files = sorted(_glob.glob(os.path.join(output_dir, glob_pattern)))
+        if not all_files:
+            print(f"ERROR: no files found matching {os.path.join(output_dir, glob_pattern)}")
+            return
+        print(f"  -> Found {len(all_files)} files to hadd")
+
+        output_eos = f"root://eosuser.cern.ch//{output_dir_normalized}/{output_name}"
+
+        # build input file list with xrootd paths
+        input_files_str = " \\\n    ".join(
+            f"root://eosuser.cern.ch//{output_dir_normalized}/{os.path.basename(f)}"
+            for f in all_files
+        )
+
+        os.makedirs(self._script_batch_location, exist_ok=True)
+
+        hadd_sh_path  = os.path.join(self._script_batch_location, f"hadd_{tag}.sh")
+        hadd_sub_path = os.path.join(self._script_batch_location, f"hadd_{tag}.sub")
+
+        hadd_tool_basename = os.path.basename(hadd_tool_path)
+        # if hadd tool is on EOS, download it in the bash script instead of transfer_input_files
+        hadd_tool_abs = os.path.abspath(hadd_tool_path) if not os.path.isabs(hadd_tool_path) else hadd_tool_path
+        if hadd_tool_abs.startswith('/eos'):
+            import re as _re
+            hadd_tool_normalized = _re.sub(r'^/eos/home-([a-z])/',
+                                           lambda m: f"/eos/user/{m.group(1)}/", hadd_tool_abs)
+            hadd_tool_download = f"xrdcp -f root://eosuser.cern.ch//{hadd_tool_normalized} {hadd_tool_basename}"
+            hadd_tool_transfer = None
+        else:
+            hadd_tool_download = ""
+            hadd_tool_transfer = hadd_tool_path
+
+        hadd_sh = f"""#!/bin/bash
+set -e
+echo "hadd job started at $(date)"
+echo "Running on node $(hostname)"
+source /cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh
+{proxy_lines}
+{hadd_tool_download}
+echo "Running {hadd_tool_basename}..."
+python {hadd_tool_basename} \\
+    {hadd_tool_args} \\
+    {output_name} \\
+    {input_files_str}
+
+echo "hadd done at $(date)"
+xrdcp -f {output_name} {output_eos}
+rm -f {output_name}
+echo "Done at $(date)"; ls -lh
+"""
+        with open(hadd_sh_path, "w") as f:
+            f.write(hadd_sh)
+        os.system(f"chmod +x {hadd_sh_path}")
+
+        transfer_files = x509_proxy
+        if hadd_tool_transfer:
+            transfer_files = f"{hadd_tool_transfer}, {x509_proxy}"
+
+        hadd_sub = f"""# hadd job for {tag}
+executable              = {hadd_sh_path}
+transfer_input_files    = {transfer_files}
+should_transfer_files   = YES
+when_to_transfer_output = ON_EXIT
+transfer_output_files   =
+output                  = {self._script_batch_location}/hadd_{tag}.out
+error                   = {self._script_batch_location}/hadd_{tag}.err
+log                     = {self._script_batch_location}/hadd_{tag}.log
+getenv                  = True
++JobFlavour             = "workday"
+queue
+"""
+        with open(hadd_sub_path, "w") as f:
+            f.write(hadd_sub)
+
+        print(f"  -> hadd script : {hadd_sh_path}")
+        print(f"  -> submit file : {hadd_sub_path}")
+        print(f"  -> output      : {output_eos}")
+        print("Submitting hadd job...")
+        subprocess.run(["condor_submit", hadd_sub_path],
+                       cwd=self._script_batch_location)
+
+    # _____________________________________________________________________________
     #  parallelCompile — shared
     # _____________________________________________________________________________
 

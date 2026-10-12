@@ -406,6 +406,26 @@ int main() {{
         self.generate_makefile(list_of_files_to_compile, "MakefileSnapshotNuisances")
         print("Scripts generated. To compile: make -f MakefileSnapshotNuisances -j8")
 
+    # _____________________________________________________________________________
+    #  haddBatch — hadd all snapshot files into one per tag
+    # _____________________________________________________________________________
+
+    def haddBatch(self, tag, haddnano_path=None):
+        if haddnano_path is None:
+            haddnano_path = os.path.join(_SCRIPTS_DIR, "haddnano.py")
+        super().haddBatch(
+            tag          = tag,
+            output_dir   = self._folder_where_to_save_trees,
+            glob_pattern = "nanoLatino_snapshot____*.root",
+            output_name  = f"snapshot_{tag}.root",
+            hadd_tool_path = haddnano_path,
+            hadd_tool_args = "",   # haddnano doesn't need extra args
+        )
+
+    # _____________________________________________________________________________
+    #  submitBatch hooks
+    # _____________________________________________________________________________
+
     def _extra_transfer_files_for_submit(self, precompiled, x509_proxy, extra_files_str):
         return f"{x509_proxy}{extra_files_str}"
 
@@ -475,6 +495,8 @@ if __name__ == '__main__':
     parser.add_argument("--checkBatch",      action='store_true', dest="checkBatch")
     parser.add_argument("--resubmit",        action='store_true', dest="resubmit")
     parser.add_argument("--silentMode",      action='store_true', dest="silentMode")
+    parser.add_argument("--haddBatch",       action='store_true', dest="haddBatch",
+                        help="Submit a single condor job to hadd all snapshot files")
     parser.add_argument("--shapeNuisances",  action='store_true', dest="shapeNuisances",
                         help="Generate alternative TTree files for shape nuisances")
 
@@ -516,7 +538,7 @@ if __name__ == '__main__':
     factory.setConditions(opt.silentMode)
 
     if not any([opt.submitBatch, opt.checkBatch, opt.localCompile,
-                opt.shapeNuisances]):
+                opt.shapeNuisances, opt.haddBatch]):
         factory.makeScripts()
 
     if opt.shapeNuisances:
@@ -528,6 +550,11 @@ if __name__ == '__main__':
 
     if opt.submitBatch:
         factory.submitBatch()
+
+    if opt.haddBatch:
+        tag = getattr(opt, 'tag', 'snapshot')
+        haddnano_path = getattr(opt, 'haddnanoPath', None)
+        factory.haddBatch(tag, haddnano_path=haddnano_path)
 
     if opt.checkBatch:
         factory.checkBatch(resubmit=opt.resubmit)
