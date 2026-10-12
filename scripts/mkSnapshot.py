@@ -65,6 +65,9 @@ class SnapshotFactory(AnalysisFactory):
             os.path.expandvars(folder_where_to_save_trees))
 
     # _____________________________________________________________________________
+    def job_prefix(self):
+        return "my_snapshot"
+
     def output_file_name(self, sampleName, subname, i):
         return f"nanoLatino_snapshot____{sampleName}_{subname}_{i}.root"
 
@@ -311,7 +314,7 @@ int main() {{
                     out_file = self.output_file_name(sampleName, subname, i)
 
                     name_code = (self._scripts_run_folder + "/" + sampleName + "/" + subname
-                                 + "/" + "my_script_" + str(i))
+                                 + "/" + self.job_prefix() + "_" + sampleName + "_" + subname + "_" + str(i))
 
                     self.create_cpp_source_list_of_files(
                         name_code, "Events", chunk['files'],

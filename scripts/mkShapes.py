@@ -28,6 +28,9 @@ class ShapeFactory(AnalysisFactory):
         self._outputRootFile = 'myhistos.root'
 
     # _____________________________________________________________________________
+    def job_prefix(self):
+        return "my_run_analysis"
+
     def output_file_name(self, sampleName, subname, i):
         return f"root_file___{sampleName}_{subname}_{i}.root"
 
@@ -597,7 +600,7 @@ int main() {{
 
                 for i, chunk in enumerate(chunks):
                     name_code = (self._scripts_run_folder + "/" + sampleName + "/" + subname
-                                 + "/" + "my_script_" + str(i))
+                                 + "/" + self.job_prefix() + "_" + sampleName + "_" + subname + "_" + str(i))
                     out_file  = self.output_file_name(sampleName, subname, i)
 
                     self.create_cpp_source_list_of_files(

@@ -142,6 +142,7 @@ class AnalysisFactory:
       - parallelCompile
 
     Subclasses must implement:
+      - job_prefix()             -> str   e.g. "my_run_analysis" or "my_snapshot"
       - output_file_name(sampleName, subname, i) -> str
       - makeScripts()            -> calls self._make_scripts_loop(...)
       - generate_makefile(...)
@@ -473,7 +474,7 @@ class AnalysisFactory:
                 chunks = self._get_chunks(sample, list_root_files)
 
                 for i, chunk in enumerate(chunks):
-                    job_name   = "my_script_" + str(i)
+                    job_name   = self.job_prefix() + "_" + sampleName + "_" + subname + "_" + str(i)
                     name_bash  = os.path.join(self._script_batch_location, sampleName, subname, job_name + ".sh")
                     out_file   = self.output_file_name(sampleName, subname, i)
                     name_folder      = os.path.join(self._script_batch_location, sampleName, subname)
@@ -546,11 +547,14 @@ class AnalysisFactory:
             for subname, list_root_files in self._normalize_sample_name(sample['name']).items():
                 if list_root_files:
                     exe = os.path.join(self._scripts_run_folder, sampleName, subname,
-                                       "my_script_0")
+                                       self.job_prefix() + "_" + sampleName + "_" + subname + "_0")
                     return os.path.isfile(exe)
         return False
 
     # Abstract — subclass must implement
+    def job_prefix(self):
+        raise NotImplementedError
+
     def output_file_name(self, sampleName, subname, i):
         raise NotImplementedError
 
@@ -593,7 +597,7 @@ class AnalysisFactory:
                 for sh_file in sh_files:
                     job_name  = sh_file[:-3]
                     abs_sh    = os.path.abspath(os.path.join(subname_dir, sh_file))
-                    suffix    = job_name.replace("my_script_", "", 1)
+                    suffix    = job_name.replace(self.job_prefix() + "_", "", 1)
                     _out      = self._output_file_from_suffix(sampleName, subname, suffix)
                     root_file = _out if os.path.isabs(_out) else os.path.join(self._outputDir, _out)
 
