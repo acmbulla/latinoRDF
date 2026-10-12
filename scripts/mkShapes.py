@@ -698,6 +698,7 @@ if __name__ == '__main__':
     parser.add_argument("--submitBatch",     action='store_true', dest="submitBatch")
     parser.add_argument("--hadd",            action='store_true', dest="haddRootFiles")
     parser.add_argument("--checkBatch",      action='store_true', dest="checkBatch")
+    parser.add_argument("--resubmit",        action='store_true', dest="resubmit")
     parser.add_argument("--silentMode",      action='store_true', dest="silentMode")
 
     opt = parser.parse_args()
@@ -735,6 +736,6 @@ if __name__ == '__main__':
         hadd_cmd = f"hadd -j 8 -f {opt.outputDir}/root_file_joined.root {opt.outputDir}/root_file___*.root"
         os.system(hadd_cmd)
     if opt.checkBatch:
-        factory.checkBatch()
+        factory.checkBatch(resubmit=opt.resubmit)
 
     print("\n\n I'm done ...\n\n")

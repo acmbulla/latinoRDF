@@ -473,6 +473,7 @@ if __name__ == '__main__':
     parser.add_argument("--localCompile",    action='store_true', dest="localCompile")
     parser.add_argument("--submitBatch",     action='store_true', dest="submitBatch")
     parser.add_argument("--checkBatch",      action='store_true', dest="checkBatch")
+    parser.add_argument("--resubmit",        action='store_true', dest="resubmit")
     parser.add_argument("--silentMode",      action='store_true', dest="silentMode")
     parser.add_argument("--shapeNuisances",  action='store_true', dest="shapeNuisances",
                         help="Generate alternative TTree files for shape nuisances")
@@ -529,6 +530,6 @@ if __name__ == '__main__':
         factory.submitBatch()
 
     if opt.checkBatch:
-        factory.checkBatch()
+        factory.checkBatch(resubmit=opt.resubmit)
 
     print("\n\n I'm done ...\n\n")

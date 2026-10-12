@@ -138,7 +138,7 @@ class AnalysisFactory:
       - cuts / categories
       - FilesPerJob chunking
       - submitBatch (proxy check, precompiled vs compile-on-node, single .sub file)
-      - checkBatch
+      - checkBatch + --resubmit
       - parallelCompile
 
     Subclasses must implement:
@@ -573,7 +573,7 @@ class AnalysisFactory:
     #  checkBatch — shared
     # _____________________________________________________________________________
 
-    def checkBatch(self):
+    def checkBatch(self, resubmit=False):
         print("=====================")
         print("==== check Batch ====")
         print("=====================\n")
@@ -646,6 +646,78 @@ class AnalysisFactory:
             return
 
         print(f"\nMissing/failed jobs: {len(missing_sh)}")
+        if not resubmit:
+            print("Run with --resubmit to generate submit_missing.sub and resubmit.")
+            return
+
+        # build submit_missing.sub
+        submit_all_path = os.path.join(self._script_batch_location, "submit_all.sub")
+        if not os.path.exists(submit_all_path):
+            print(f"ERROR: {submit_all_path} not found, cannot resubmit.")
+            return
+
+        with open(submit_all_path, 'r') as f:
+            all_lines = f.readlines()
+
+        header_lines = []
+        for line in all_lines:
+            header_lines.append(line)
+            if line.strip().startswith("queue executable"):
+                break
+
+        exe_to_entry = {}
+        in_queue = False
+        for line in all_lines:
+            if not in_queue:
+                if line.strip().startswith("queue executable"):
+                    in_queue = True
+                continue
+            stripped = line.strip()
+            if not stripped or stripped == ')':
+                continue
+            exe_path = os.path.abspath(stripped.split(',')[0].strip())
+            exe_to_entry[exe_path] = line
+
+        filtered_entries = []
+        unmatched        = []
+        missing_sh_set   = set(missing_sh)
+        for sh in missing_sh:
+            abs_sh = os.path.abspath(sh)
+            if abs_sh in exe_to_entry:
+                filtered_entries.append(exe_to_entry[abs_sh])
+            else:
+                unmatched.append(abs_sh)
+
+        for abs_sh in unmatched:
+            sh_basename = os.path.basename(abs_sh)
+            job_name    = sh_basename[:-3]
+            parts       = abs_sh.split(os.sep)
+            subname_    = parts[-2]
+            sampleName_ = parts[-3]
+            name_folder_code = os.path.join(self._scripts_run_folder, sampleName_, subname_)
+            abs_exe     = os.path.join(name_folder_code, job_name)
+            abs_cpp_    = os.path.join(name_folder_code, job_name + ".cpp")
+            job_exe     = abs_exe if os.path.exists(abs_exe) else abs_cpp_
+            log_dir_    = os.path.join(os.path.dirname(abs_sh), "log")
+            out_f       = os.path.join(log_dir_, job_name + ".sh.out")
+            err_f       = os.path.join(log_dir_, job_name + ".sh.err")
+            log_f       = os.path.join(log_dir_, job_name + ".sh.log")
+            filtered_entries.append(f"  {abs_sh}, {job_exe}, {out_f}, {err_f}, {log_f}\n")
+
+        if not filtered_entries:
+            print("WARNING: could not build any entries for submit_missing.sub.")
+            return
+
+        submit_missing_path = os.path.join(self._script_batch_location, "submit_missing.sub")
+        with open(submit_missing_path, 'w') as f:
+            f.writelines(header_lines)
+            f.writelines(filtered_entries)
+            f.write(")\n")
+
+        print(f"\nCreated: {submit_missing_path}  ({len(filtered_entries)} jobs)")
+        print("Submitting missing jobs ...")
+        subprocess.run(["condor_submit", submit_missing_path], cwd=self._script_batch_location)
+
     def _output_file_from_suffix(self, sampleName, subname, suffix):
         """Map job suffix -> expected output root file name. Override in subclass."""
         raise NotImplementedError
