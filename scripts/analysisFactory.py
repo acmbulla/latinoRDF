@@ -536,7 +536,7 @@ class AnalysisFactory:
 
         print(f"Created: {global_submit_path}  ({len(queue_rows)} jobs)")
         print("Submitting all jobs with a single condor_submit ...")
-        subprocess.run(["condor_submit", global_submit_path])
+        subprocess.run(["condor_submit", global_submit_path], cwd=self._script_batch_location)
 
     # Hooks for submitBatch — override in subclass if needed
     def _prepare_submit_batch(self, root_cflags, root_libs):
