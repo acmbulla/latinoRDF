@@ -1,0 +1,327 @@
+# CLAUDE.md — latinoRDF
+
+Reference for contributors (human and AI) working on **latinoRDF**, the CMS
+RDataFrame-based analysis framework for histogram production, plotting and
+datacard creation.
+
+Initialize the environment first so the scripts are discoverable:
+
+```bash
+source setup.sh
+```
+
+---
+
+## 1. Repository layout
+
+| Path | Contents |
+|---|---|
+| `scripts/` | The executable framework: `mkShapes.py`, `mkSnapshot.py`, `analysisFactory.py`, `mkPlot.py`, `mkDatacards.py`, `mkMergeYears.py`, `haddfast.py`, `haddnano.py`, `easyDescription.py` |
+| `lib/` | Plot styling helpers (`tdrStyle.py`, `CMS_lumi.py`) and `search_files.py` |
+| `plotsConfigurationsRDF/` | **Separate git repository** (`acmbulla/plotsConfigurationsRDF`), ignored by this repo via `.gitignore:209`. Holds the per-analysis, per-year configuration files. |
+
+> **Important:** `plotsConfigurationsRDF/` is a *different repo*. Changes to
+> analysis configs (including the `gInterpreter` removal, see §6) are committed
+> and reviewed there, **not** in a latinoRDF branch.
+
+### Searching the tree
+
+The configured shell wraps `grep` with `--ignore-files`, which honours
+`.gitignore`. Because `plotsConfigurationsRDF/` is gitignored, a plain
+`grep -r <pattern> .` from the repo root **silently finds nothing there**.
+Use `command grep -r ...` (or `git grep` inside the nested repo) when searching
+configuration files.
+
+---
+
+## 2. Scripts and their purpose
+
+### `analysisFactory.py` — shared base class
+Defines `AnalysisFactory`, the base class for both producers. It owns everything
+common up to and including `current_node` + cuts:
+
+- the ordered aliases/functions pipeline and C++ code generation
+  (`_build_aliases_ordered`, `_build_cpp_common`)
+- weights and `supercut` handling
+- cuts / categories
+- job chunking: `EventsPerJob` / `FilesPerJob`, with parallel event counting and
+  a JSON cache (`samples_metadata.json`)
+- `splitParts` / `useParts` MC year splitting via RDataFrame `Range()`
+- `submitBatch` (proxy check, pre-compiled vs compile-on-node, single `.sub` file)
+- `checkBatch` and `--resubmit`
+- `parallelCompile`
+
+It also provides the config loaders used by every script:
+`load_config_files`, `read_exec`, `defaultParser`, `loadDefaultOptions`.
+
+Subclasses must implement `job_prefix()`, `output_file_name()`, `makeScripts()`,
+`generate_makefile()`, `_build_cpp_output()`, `_build_cpp_header()`,
+`_check_output_exists()`, `_build_bash_precompiled()`,
+`_build_bash_compile_on_node()` and `_extra_transfer_files_for_submit()`.
+
+### `mkShapes.py` — histogram production (`ShapeFactory`)
+Generates and runs the C++ that fills histograms for every
+sample × cut × variable × nuisance. Reads nanoAOD directly, or existing
+snapshots via `makeFromSnapshot()` (`--fromSnapshot`).
+
+Options: `--parallelCompile`, `--localCompile`, `--fromSnapshot`,
+`--submitBatch`, `--hadd`, `--haddBatch`, `--checkBatch`, `--resubmit`,
+`--silentMode`.
+
+### `mkSnapshot.py` — skimmed-tree production (`SnapshotFactory`)
+Writes reduced nanoAOD-style trees (snapshots) so later shape production can
+skip the expensive full-nanoAOD pass. Tracks what was produced via
+`SnapshotMetadata`, and supports `--patch` to top up an incomplete snapshot set.
+
+Options: `--localCompile`, `--submitBatch`, `--checkBatch`, `--resubmit`,
+`--silentMode`, `--haddBatch`, `--patch`, `--shapeNuisances`, `--force`.
+
+### `mkMergeYears.py`
+Merges per-year shape files into a combined multi-year result, handling
+correlated vs uncorrelated nuisances across years.
+
+### `haddfast.py`
+Fast parallel merger for **shape/histogram** ROOT files. Used by
+`mkShapes.py --haddBatch`.
+
+### `haddnano.py`
+nanoAOD-aware merger that preserves branch structure and zero-fills missing
+branches. Used by `mkSnapshot.py --haddBatch`.
+
+### `mkPlot.py`, `mkDatacards.py`, `easyDescription.py`
+Plot rendering, datacard writing and configuration summaries. Not touched by
+the current refactor.
+
+---
+
+## 3. Configuration file conventions
+
+A configuration lives in one directory per analysis and year, e.g.
+`plotsConfigurationsRDF/SSWW/2022/`. `configuration.py` is the entry point and
+names all the others.
+
+| File | Variable defined | Purpose |
+|---|---|---|
+| `configuration.py` | module-level names | Entry point: `tag`, `tagger`, `lumi`, output dirs, batch paths, and the filenames below |
+| `samples.py` | `samples` | Sample definitions: file lists, weights, per-sample job splitting |
+| `cuts.py` | `cuts`, `supercut` | Analysis regions/categories; `supercut` is applied to every sample first |
+| `aliases.py` | `aliases` | Derived quantities and C++ helpers injected into the generated code |
+| `variables.py` | `variables` | Histogram definitions (binning, expression) |
+| `nuisances.py` | `nuisances` | Systematic variations |
+| `plot.py` | `plot` | Cosmetics: colours, grouping, legend |
+| `structure.py` | `structure` | Datacard process structure |
+| `snapshot.py` | — | Snapshot configuration, when used |
+
+Config files are executed with `exec()` by `read_exec` / `load_config_files`,
+with `os`, `sys`, `re`, `glob` pre-injected, plus `samples`, `cuts` and
+`nuisances` where relevant. Pre-seeded dicts mean a file may write
+`cuts['SR'] = '...'` without first creating the dict.
+
+### Per-sample job splitting keys (in `samples.py`)
+
+| Key | Effect |
+|---|---|
+| `FilesPerJob` | N input files per batch job (default 1) |
+| `EventsPerJob` | Split by event count; triggers parallel counting + `samples_metadata.json` cache |
+| `splitParts` | Divide the sample's total events into N equal parts |
+| `useParts` | Which parts (0-indexed) this sample instance uses — e.g. `splitParts=5, useParts=[0,1]` takes the first ~40% of events |
+
+`splitParts` takes priority over `EventsPerJob`, which takes priority over
+`FilesPerJob`.
+
+### Alias keys recognised by the code generator
+
+| Key | Meaning | Where it lands in the generated `.cpp` |
+|---|---|---|
+| `expr` | RDataFrame expression | `SafeDefine(...)` inside `main()` |
+| `samples` | Restrict the alias to these samples | — |
+| `external` | Path to a `.cc`/`.cpp`/`.h` file; its contents are spliced in verbatim, **deduplicated by path** | before `main()` |
+| `linesToAdd` | Literal lines (typically `#include`), deduplicated | top of file, before `external` content |
+| `linesToGlobal` | Literal lines at global scope, deduplicated — **the place for global object instances** | before `main()`, *after* `external` content |
+| `linesToProcess` | Literal lines emitted inside `main()`, **not** deduplicated | first statements in `main()` |
+| `function` + `variables` | Call a C++ functor over the listed columns | `.Define(...)` chain |
+| `xmlfile` + `variables` | TMVA `RReader` model evaluation | `.Define(...)` chain |
+
+Emission order before `main()` is:
+`linesToAdd` → `external` → `linesToGlobal`.
+That ordering is what makes §6 work: class definitions arrive before the global
+instances that use them.
+
+> **Gotcha:** `_build_aliases_ordered` routes an alias into the "function"
+> branch only if it has `function`, `linesToAdd` **or** `linesToGlobal`. An alias
+> carrying only `external` + `expr` is classified as a plain `expr` and **its
+> `external` file is never read.** Always pair `external` with `linesToGlobal`
+> (or `linesToAdd`).
+
+---
+
+## 4. Batch workflow
+
+```
+mkShapes.py --submitBatch     # generate .cpp/.sh, compile, submit to HTCondor
+mkShapes.py --checkBatch      # report which jobs are missing or failed
+mkShapes.py --checkBatch --resubmit   # rewrite submit_all.sub with only the missing/failed jobs
+mkShapes.py --haddBatch       # submit the merge step as HTCondor jobs
+```
+
+Notes:
+
+- `submitBatch` writes one `submit_all.sub` describing all jobs, and runs
+  `condor_submit` with `cwd=script_batch_location`.
+- Batch script names are derived from the generated `.cpp` filename (not the
+  legacy generic `my_script_*`), so jobs are identifiable in the queue.
+- Two compilation modes are detected automatically: **pre-compiled** (binary
+  shipped to the node) and **compile-on-node**.
+- EOS copies use `xrdcp -f`; the job creates its output directory with
+  `mkdir -p` before the executable runs.
+- A valid X509 proxy is required; `submitBatch` checks it and aborts early if
+  missing.
+- `--haddBatch` uses `haddfast.py` for shapes and `haddnano.py` for snapshots.
+- Compilation links ROOT (`root-config --cflags/--libs`) plus
+  `-lcorrectionlib`, so `correction.h`-dependent helpers compile and link
+  without extra configuration.
+
+## 5. Snapshot workflow
+
+```
+mkSnapshot.py --submitBatch           # produce skimmed trees
+mkSnapshot.py --checkBatch [--resubmit]
+mkSnapshot.py --haddBatch             # merge with haddnano.py
+mkSnapshot.py --patch                 # top up an incomplete snapshot set
+mkShapes.py --fromSnapshot --submitBatch   # fill histograms from snapshots
+```
+
+`mkShapes.py --fromSnapshot` routes through `makeFromSnapshot()`, which reads
+the snapshot trees instead of nanoAOD. `SnapshotMetadata` records what exists so
+`--patch` can regenerate only what is missing.
+
+---
+
+## 6. gInterpreter policy — **forbidden**
+
+Runtime JIT declaration has been **rejected by reviewers** and must not be
+reintroduced.
+
+### Why it was there in the first place
+
+This is the key point, and it is not obvious. Two different `Define` overloads
+are in play:
+
+1. **String-expression `Define`** — `SafeDefine(df, name, "some expression")`
+   resolves to `df.Define(name, std::string expr)` (`mkShapes.py:135-138`).
+   RDataFrame hands that string to **Cling at runtime**. Cling only sees what
+   has been declared *into the interpreter*; it does **not** see types or
+   objects defined in the compiled translation unit of the generated binary.
+2. **Typed callable `Define`** — `df.Define(name, callable, {"col", ...})`.
+   Fully compiled, no interpreter involved.
+
+The fake-rate and b-tag aliases used form 1 (`'expr'`). For a JIT-compiled
+expression string to resolve `fr_reader_nominal(...)`, that class *and* that
+instance had to exist **inside Cling** — which is exactly what
+`gInterpreter->Declare` / `ProcessLine` did. So the original pattern was not
+gratuitous: with `'expr'`, dropping `Declare` genuinely breaks.
+
+It follows that **`external` + `linesToGlobal` alone is not a fix.** A class
+spliced before `main()` is invisible to the JIT that compiles the `expr`
+string. The alias has to stop using `expr` at all.
+
+### Required instead: the VBS_functions form
+
+Use the typed-callable form already established by `VBS_functions.cpp`:
+`function` + `variables` + `external`, and **no `expr`**.
+
+```python
+aliases['zstar_max'] = {
+    'function' : 'computeZstar',
+    'variables': ['Lepton_eta', 'CleanJet_eta'],
+    'external' : '../utils/macros/VBS_functions.cpp',
+    'samples'  : ALL,
+}
+```
+
+For a class that needs construction arguments, add the instance at global scope
+with `linesToGlobal` and name that instance as the `function`:
+
+```python
+aliases['fakeW'] = {
+    'external'     : f'{macros}fake_rate_reader_class.cc',
+    'linesToGlobal': [
+        f'fake_rate_reader fr_reader_nominal("{eleWP}", "{muWP}", "nominal", 2, "std", "{fakerates}", "2022_v12_pt");'
+    ],
+    'function'     : 'fr_reader_nominal',
+    'variables'    : ['Lepton_pdgId', 'Lepton_pt', 'Lepton_eta',
+                      'Lepton_isTightMuon', 'Lepton_isTightElectron',
+                      'Lepton_muonIdx', 'CleanJet_pt', 'nCleanJet'],
+    'samples'      : ['Fake'],
+}
+```
+
+Emission order before `main()` (§3) is `linesToAdd` → `external` →
+`linesToGlobal`, so the class is always defined before the instance.
+
+### Constraint this imposes on helper classes
+
+`variables` entries are **column names only** — the typed `Define` passes
+columns, not literals. Any configuration constant must therefore be a
+**constructor** argument, not an `operator()` argument.
+
+- `fake_rate_reader::operator()` already takes only columns → converts with no
+  C++ change.
+- `btagSFbc` / `btagSFlight::operator()` currently take 6 columns **plus 4
+  string literals** (`WP`, `shift`, `tagger`, `year`). Those four must move
+  into the constructor, which is a real API change to
+  `evaluate_btagSF{bc,light}.cc`.
+
+### Forbidden patterns
+
+```python
+'linesToAdd'    : ['#include "TInterpreter.h"'],
+'linesToProcess': [f'gInterpreter->Declare(R"FAKE({macro_source})FAKE");'],
+```
+
+```python
+'linesToProcess': [f'gInterpreter->ProcessLine("btagSFbc inst(\\"{path}\\", \\"{year}\\");");'],
+```
+
+Also forbidden: `gInterpreter->Declare`, `gInterpreter->ProcessLine`,
+`gROOT->ProcessLine` and `TInterpreter.h` anywhere in generated C++ or in
+`aliases.py` / `nuisances.py`.
+
+Rationale beyond the reviewers' objection: JIT-ing a class at runtime inside an
+already-compiled binary costs Cling startup on every batch job, defers all type
+errors to runtime, and hides the source from the compiler.
+
+### Notes
+
+- `external` deduplicates by path, so every alias may safely declare its own
+  dependency.
+- Helper sources must be include-guard-safe and self-contained. The macros in
+  `plotsConfigurationsRDF/SSWW/utils/macros/` already are:
+  `fake_rate_reader_class.cc` (`FAKERATEREADER`), `evaluate_btagSFbc.cc`
+  (`BTAGSF`), `evaluate_btagSFlight.cc` (`BTAGLIGHTSF`), `VBS_functions.cpp`.
+- The separate `_fakeRateDecl` / `_btagSF{bc,light}Decl` aliases carrying
+  `'expr': '1.'` existed only to host the one-off `Declare`. They are no longer
+  needed and should be deleted.
+
+## 7. Commit conventions
+
+Conventional-commit prefixes, imperative mood, lower-case subject:
+
+```
+feat:     new user-visible capability
+fix:      bug fix or correction of a rejected pattern
+refactor: behaviour-preserving restructuring
+docs:     documentation only
+chore:    tooling, cleanup, no behaviour change
+```
+
+Rules for this repo:
+
+- **One feature per commit**, self-contained and reviewable on its own.
+- **Every commit must leave the code in a working state** — the branch is
+  reviewed commit by commit upstream.
+- Framework changes (`scripts/`, `lib/`) go to **latinoRDF**; analysis
+  configuration changes go to **plotsConfigurationsRDF**. Never mix the two in
+  one commit — they are different repositories.
+- Feature work happens on a branch (e.g. `feature/clean-history`), never
+  directly on `main`.
