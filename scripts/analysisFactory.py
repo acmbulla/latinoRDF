@@ -136,7 +136,8 @@ class AnalysisFactory:
       - weights
       - supercut
       - cuts / categories
-      - EventsPerJob / FilesPerJob chunking with parallel event counting + JSON cache
+      - MaxEventsPerJob / FilesPerJob chunking with parallel event counting + JSON cache
+      - split / era event slicing across eras via RDataFrame Range()
       - submitBatch (proxy check, precompiled vs compile-on-node, single .sub file)
       - checkBatch + --resubmit
       - parallelCompile
@@ -294,7 +295,7 @@ class AnalysisFactory:
         return results
 
     @staticmethod
-    def _make_event_chunks(list_root_files, events_per_job, nevents_map):
+    def _make_event_chunks(list_root_files, max_events_per_job, nevents_map):
         chunks = []
         current_files  = []
         current_events = 0
@@ -302,18 +303,18 @@ class AnalysisFactory:
             n = nevents_map.get(file_path, 0)
             if n == 0:
                 continue
-            if n > events_per_job:
+            if n > max_events_per_job:
                 if current_files:
                     chunks.append({'files': current_files, 'range_start': None, 'range_end': None, 'nevents': current_events})
                     current_files  = []
                     current_events = 0
                 start = 0
                 while start < n:
-                    end = min(start + events_per_job, n)
+                    end = min(start + max_events_per_job, n)
                     chunks.append({'files': [file_path], 'range_start': start, 'range_end': end, 'nevents': end - start})
                     start = end
             else:
-                if current_events + n > events_per_job and current_files:
+                if current_events + n > max_events_per_job and current_files:
                     chunks.append({'files': current_files, 'range_start': None, 'range_end': None, 'nevents': current_events})
                     current_files  = []
                     current_events = 0
@@ -323,30 +324,54 @@ class AnalysisFactory:
             chunks.append({'files': current_files, 'range_start': None, 'range_end': None, 'nevents': current_events})
         return chunks
 
-    def _apply_split_parts(self, list_root_files, sample):
+    def _apply_era_split(self, list_root_files, sample):
         """
-        Filter list_root_files based on splitParts/useParts using event counts.
-        Returns a list of chunks (same format as _make_event_chunks) covering
-        only the requested fraction of total events, with Range where needed.
+        Reduce a sample to the slice of events belonging to one era.
 
-        splitParts: int   — divide total events into N equal parts
-        useParts:   list  — which parts to use (0-indexed)
+        split: list of percentages, one entry per era, summing to 100
+        era:   which era to use, 1-based index into that list
 
-        Example: splitParts=5, useParts=[0,1] → first ~40% of events
-        Files are sorted for reproducibility. Range is used when a file
-        straddles a part boundary.
+        Example: split=[40, 40, 20], era=2  ->  the middle 40% of the events.
+
+        The eras are contiguous and non-overlapping by construction: era i
+        covers the events between the cumulative percentage before it and the
+        cumulative percentage after it. The last era always ends on the last
+        event, so rounding can neither drop nor duplicate events.
+
+        Files are sorted for reproducibility, and Range() is applied to the
+        files that straddle an era boundary. Returns a list of chunks in the
+        same format as _make_event_chunks, or None when the sample does not
+        use an era split.
         """
-        if 'splitParts' not in sample:
+        if 'split' not in sample:
             return None  # signal: no split needed
 
-        split_parts = sample['splitParts']
-        use_parts   = set(sample.get('useParts', [0]))
+        split = sample['split']
+        if not isinstance(split, (list, tuple)) or len(split) == 0:
+            raise ValueError(
+                f"'split' must be a non-empty list of percentages, got {split!r}")
+        if any(not isinstance(p, (int, float)) or p <= 0 for p in split):
+            raise ValueError(
+                f"'split' percentages must all be positive numbers, got {split!r}")
+        if abs(sum(split) - 100) > 1e-6:
+            raise ValueError(
+                f"'split' percentages must sum to 100, got {split!r} (sum = {sum(split)})")
+
+        if 'era' not in sample:
+            raise ValueError(
+                f"'split' requires 'era', a 1-based index into {split!r}")
+        era = sample['era']
+        if isinstance(era, bool) or not isinstance(era, int):
+            raise ValueError(f"'era' must be an integer, got {era!r}")
+        if not 1 <= era <= len(split):
+            raise ValueError(
+                f"'era' must be between 1 and {len(split)} for split={split!r}, got {era}")
+
         nevents_map = getattr(self, '_nevents_map', {})
 
         # sort files for reproducibility
         sorted_files = sorted(list_root_files)
 
-        # get nevents per file from cache
         file_nevents = []
         for f in sorted_files:
             n = nevents_map.get(f, 0)
@@ -359,76 +384,75 @@ class AnalysisFactory:
         if total_events == 0:
             return []
 
-        events_per_part = total_events / split_parts
+        # cumulative event boundaries, one more than the number of eras
+        edges   = [0]
+        running = 0.0
+        for p in split:
+            running += p
+            edges.append(int(round(total_events * running / 100.0)))
+        edges[-1] = total_events          # absorb any rounding into the last era
 
-        # build part boundaries: part i covers [i*epj, (i+1)*epj)
-        part_boundaries = [(int(i * events_per_part), int((i + 1) * events_per_part))
-                           for i in range(split_parts)]
-        # last part goes to end
-        part_boundaries[-1] = (part_boundaries[-1][0], total_events)
+        req_start, req_end = edges[era - 1], edges[era]
+        print(f"  -> era {era}/{len(split)} ({split[era - 1]}%): "
+              f"events [{req_start}, {req_end}) of {total_events}")
 
-        # build requested event ranges from useParts
-        requested_ranges = []
-        for p in sorted(use_parts):
-            if p < split_parts:
-                requested_ranges.append(part_boundaries[p])
-
-        # merge adjacent requested ranges
-        merged_ranges = []
-        for start, end in requested_ranges:
-            if merged_ranges and start == merged_ranges[-1][1]:
-                merged_ranges[-1] = (merged_ranges[-1][0], end)
-            else:
-                merged_ranges.append((start, end))
-
-        # now map global event ranges to file chunks with Range
+        # map the requested global event range onto the files
         chunks = []
-        cumulative = 0
-        file_idx   = 0
+        cursor = 0                        # global index of this file's first event
+        for file_path, n in zip(sorted_files, file_nevents):
+            if n == 0:
+                continue
+            file_start, file_end = cursor, cursor + n
+            cursor = file_end
 
-        for req_start, req_end in merged_ranges:
-            # advance to the file containing req_start
-            while file_idx < len(sorted_files) and cumulative + file_nevents[file_idx] <= req_start:
-                cumulative += file_nevents[file_idx]
-                file_idx   += 1
+            if file_end <= req_start or file_start >= req_end:
+                continue                  # file lies entirely outside this era
 
-            pos = req_start
-            fi  = file_idx
-            cum = cumulative
+            local_start = max(req_start, file_start) - file_start
+            local_end   = min(req_end,   file_end)   - file_start
 
-            while pos < req_end and fi < len(sorted_files):
-                file_start = cum
-                file_end   = cum + file_nevents[fi]
+            if local_start == 0 and local_end == n:
+                chunks.append({'files': [file_path], 'range_start': None,
+                               'range_end': None, 'nevents': n})
+            else:
+                chunks.append({'files': [file_path], 'range_start': local_start,
+                               'range_end': local_end,
+                               'nevents': local_end - local_start})
 
-                chunk_start = pos - file_start          # local offset in this file
-                chunk_end   = min(req_end, file_end) - file_start
-
-                full_file = (chunk_start == 0 and chunk_end == file_nevents[fi])
-
-                if full_file:
-                    chunks.append({'files': [sorted_files[fi]],
-                                   'range_start': None, 'range_end': None,
-                                   'nevents': file_nevents[fi]})
-                else:
-                    chunks.append({'files': [sorted_files[fi]],
-                                   'range_start': chunk_start, 'range_end': chunk_end,
-                                   'nevents': chunk_end - chunk_start})
-
-                pos  = file_end if chunk_end == file_nevents[fi] else req_end
-                cum += file_nevents[fi]
-                fi  += 1
-
+        # MaxEventsPerJob is a cap, so honour it inside the era too
+        max_events = sample.get('MaxEventsPerJob')
+        if max_events:
+            chunks = self._cap_chunks(chunks, max_events)
         return chunks
 
-    def _get_chunks(self, sample, list_root_files, tree="Events"):
-        """Return list of chunks for a sample, using splitParts, EventsPerJob or FilesPerJob."""
-        # splitParts takes priority
-        split_chunks = self._apply_split_parts(list_root_files, sample)
-        if split_chunks is not None:
-            return split_chunks
+    @staticmethod
+    def _cap_chunks(chunks, max_events):
+        """Subdivide single-file chunks so none covers more than max_events."""
+        capped = []
+        for chunk in chunks:
+            n = chunk['nevents']
+            if n is None or n <= max_events:
+                capped.append(chunk)
+                continue
+            start = chunk['range_start'] or 0
+            pos   = start
+            end   = start + n
+            while pos < end:
+                stop = min(pos + max_events, end)
+                capped.append({'files': chunk['files'], 'range_start': pos,
+                               'range_end': stop, 'nevents': stop - pos})
+                pos = stop
+        return capped
 
-        if 'EventsPerJob' in sample:
-            return self._make_event_chunks(list_root_files, sample['EventsPerJob'],
+    def _get_chunks(self, sample, list_root_files, tree="Events"):
+        """Return chunks for a sample, using split/era, MaxEventsPerJob or FilesPerJob."""
+        # an era split takes priority, and applies MaxEventsPerJob within the era
+        era_chunks = self._apply_era_split(list_root_files, sample)
+        if era_chunks is not None:
+            return era_chunks
+
+        if 'MaxEventsPerJob' in sample:
+            return self._make_event_chunks(list_root_files, sample['MaxEventsPerJob'],
                                            getattr(self, '_nevents_map', {}))
         make_job_every_N = sample.get('FilesPerJob', 1)
         return [{'files': list_root_files[i:i + make_job_every_N],
@@ -436,10 +460,10 @@ class AnalysisFactory:
                 for i in range(0, len(list_root_files), make_job_every_N)]
 
     def _pre_count_events(self):
-        """Pre-count events for all samples that use EventsPerJob."""
+        """Pre-count events for samples that use MaxEventsPerJob or an era split."""
         all_files = []
         for sampleName, sample in self._samples.items():
-            if 'EventsPerJob' in sample:
+            if 'MaxEventsPerJob' in sample or 'split' in sample:
                 for subname, list_root_files in self._normalize_sample_name(sample['name']).items():
                     all_files.extend(list_root_files)
         if all_files:

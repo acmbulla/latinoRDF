@@ -44,9 +44,9 @@ common up to and including `current_node` + cuts:
   (`_build_aliases_ordered`, `_build_cpp_common`)
 - weights and `supercut` handling
 - cuts / categories
-- job chunking: `EventsPerJob` / `FilesPerJob`, with parallel event counting and
-  a JSON cache (`samples_metadata.json`)
-- `splitParts` / `useParts` MC year splitting via RDataFrame `Range()`
+- job chunking: `MaxEventsPerJob` / `FilesPerJob`, with parallel event counting
+  and a JSON cache (`samples_metadata.json`)
+- `split` / `era` event slicing across eras via RDataFrame `Range()`
 - `submitBatch` (proxy check, pre-compiled vs compile-on-node, single `.sub` file)
 - `checkBatch` and `--resubmit`
 - `parallelCompile`
@@ -122,12 +122,36 @@ with `os`, `sys`, `re`, `glob` pre-injected, plus `samples`, `cuts` and
 | Key | Effect |
 |---|---|
 | `FilesPerJob` | N input files per batch job (default 1) |
-| `EventsPerJob` | Split by event count; triggers parallel counting + `samples_metadata.json` cache |
-| `splitParts` | Divide the sample's total events into N equal parts |
-| `useParts` | Which parts (0-indexed) this sample instance uses — e.g. `splitParts=5, useParts=[0,1]` takes the first ~40% of events |
+| `MaxEventsPerJob` | Upper bound on events per job. It is a cap, not a fixed size: a job may hold fewer. Triggers parallel counting + the `samples_metadata.json` cache |
+| `split` | List of percentages, one entry per era, which must sum to 100 |
+| `era` | Which era this sample instance uses, as a **1-based** index into `split` |
 
-`splitParts` takes priority over `EventsPerJob`, which takes priority over
-`FilesPerJob`.
+An era split takes priority over `MaxEventsPerJob`, which takes priority over
+`FilesPerJob`. When `split` and `MaxEventsPerJob` are both given, the era is
+selected first and `MaxEventsPerJob` then caps the jobs inside it.
+
+#### Splitting one MC production across eras
+
+`split` divides a sample's events into contiguous, non-overlapping slices and
+`era` picks one. Sharing a production between three years looks like this, with
+the same `split` repeated in each year's `samples.py`:
+
+```python
+# SSWW/2024/samples.py        SSWW/2025/samples.py        SSWW/2026/samples.py
+'split': [40, 40, 20],        'split': [40, 40, 20],      'split': [40, 40, 20],
+'era'  : 1,                   'era'  : 2,                 'era'  : 3,
+```
+
+Era 1 takes the first 40% of the events, era 2 the next 40%, era 3 the last
+20%. Non-overlap is structural — an era is one contiguous range, so it cannot
+be made to overlap another — and the last era always ends on the last event, so
+rounding can neither drop nor duplicate events. Files are sorted before slicing
+so the partition is reproducible, and `Range()` is applied to the files that
+straddle an era boundary.
+
+A malformed `split`/`era` raises `ValueError` rather than silently producing the
+wrong events: percentages that do not sum to 100, a missing `era`, a
+non-integer `era`, and an `era` outside `1..len(split)` are all rejected.
 
 ### Alias keys recognised by the code generator
 
