@@ -4,308 +4,289 @@ import sys
 argv = sys.argv
 sys.argv = argv[:1]
 
-import argparse
-
 import os
-
+import re
+import json
+import glob
+import subprocess
 import ROOT
 
-
-#
-# default parser
-#
-
-def defaultParser():
-    sys.argv = argv
-
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
-    parser.add_argument(
-        "--pycfg",
-        dest="pycfg",
-        help="input configuration file",
-        default="configuration.py",
-    )
-
-    return parser
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from analysisFactory import (AnalysisFactory, defaultParser, loadDefaultOptions,
+                             read_exec, load_config_files, _base_ns, _SCRIPTS_DIR)
 
 
-#
-# load configurations into the parser, according to configuration.py
-#
+# -----------------------------------------------------------------------
+#  Helpers
+# -----------------------------------------------------------------------
 
-def loadDefaultOptions(parser, pycfg=None, quiet=False):
-
-    if pycfg != None and os.path.exists(pycfg):
-        # print ("loadDefaultOptions: pycfg = ", pycfg)
-        handle = open(pycfg,'r')
-        local_variables = {}
-        exec(handle.read(),local_variables)
-        handle.close()
-        # clean the dictionary to remove globals due to "exec" funcionality
-        local_variables = {k: v for k, v in local_variables.items() if not (k.startswith('__') and k.endswith('__'))}
-        for opt_name, opt_value in local_variables.items():
-          parser.add_argument('--' + opt_name, default=opt_value)
-        return
-    else:
-        return
+def _extract_branch_names(expression):
+    """Extract likely branch/variable names from a C++ expression string."""
+    # remove strings, numbers, operators — keep identifiers
+    tokens = re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', expression)
+    # filter out C++ keywords and ROOT types
+    _skip = {'auto','int','float','double','bool','true','false','if','else',
+              'for','while','return','const','void','std','ROOT','RVec',
+              'abs','sqrt','pow','sin','cos','log','exp','min','max'}
+    return [t for t in tokens if t not in _skip]
 
 
+def _collect_cut_variables(cuts):
+    """Collect all variable names referenced in cut expressions."""
+    vars_used = set()
+    for cutName, cut in cuts.items():
+        expr = cut['expr'] if isinstance(cut, dict) else cut
+        for v in _extract_branch_names(expr):
+            vars_used.add(v)
+    return vars_used
 
 
-# ----------------------------------------------------- SnapshotFactory --------------------------------------
+def _collect_alias_dependencies(aliases_ordered):
+    """Collect all input variables needed by aliases."""
+    deps = {}
+    for aliasName, (kind, payload) in aliases_ordered.items():
+        if kind == 'expr':
+            deps[aliasName] = _extract_branch_names(payload)
+        elif kind == 'function' and 'variables' in payload:
+            deps[aliasName] = list(payload['variables'])
+    return deps
 
-import subprocess
 
-class SnapshotFactory:
+# -----------------------------------------------------------------------
+#  SnapshotMetadata
+# -----------------------------------------------------------------------
 
-    # _____________________________________________________________________________
+class SnapshotMetadata:
+    """
+    Tracks what has been saved in the snapshot and what still needs to be done.
+    Saved as snapshot_metadata.json in folder_where_to_save_trees.
+    """
+
+    def __init__(self, path):
+        self._path = path
+        self._data = {
+            'cut_to_dump'        : '',
+            'cut_expression'     : '',
+            'cut_variables'      : [],
+            'variables_saved'    : [],
+            'alias_dependencies' : {},
+            'weight_nuisances'   : [],
+            'shape_nuisances'    : [],
+            'patches'            : [],
+            'completed_files'    : {},
+        }
+        if os.path.exists(path):
+            with open(path, 'r') as f:
+                self._data.update(json.load(f))
+
+    def save(self):
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        with open(self._path, 'w') as f:
+            json.dump(self._data, f, indent=2)
+
+    def get(self, key, default=None):
+        return self._data.get(key, default)
+
+    def set(self, key, value):
+        self._data[key] = value
+
+    def mark_completed(self, job_key, path):
+        try:
+            mtime = os.path.getmtime(path)
+        except Exception:
+            mtime = 0
+        self._data['completed_files'][job_key] = {'path': path, 'mtime': mtime}
+
+    def is_completed(self, job_key, path):
+        entry = self._data['completed_files'].get(job_key)
+        if not entry:
+            return False
+        if not os.path.exists(path):
+            return False
+        try:
+            mtime = os.path.getmtime(path)
+            return abs(mtime - entry.get('mtime', -1)) < 2.0
+        except Exception:
+            return False
+
+    def missing_variables(self, requested):
+        saved = set(self._data.get('variables_saved', []))
+        return [v for v in requested if v not in saved]
+
+    def can_patch_from_snapshot(self, missing_vars):
+        """Check if missing variables can be derived from already-saved branches."""
+        saved = set(self._data.get('variables_saved', []))
+        alias_deps = self._data.get('alias_dependencies', {})
+        for var in missing_vars:
+            deps = alias_deps.get(var, [var])
+            if not all(d in saved for d in deps):
+                return False
+        return True
+
+
+# -----------------------------------------------------------------------
+#  SnapshotFactory
+# -----------------------------------------------------------------------
+
+class SnapshotFactory(AnalysisFactory):
+    """Produces ROOT files with a TTree (Events) snapshot per sample/chunk."""
+
     def __init__(self):
-
-        variables = {}   # FIXME needed?
-        self._variables = variables
-
-        cuts = {}
-        self._cuts = cuts
-
-        self._supercut = ''
-
-        samples = {}
-        self._samples = samples
-
-        aliases = {}
-        self._aliases = aliases
-
-        self._lumi = 1
-
-        self._treeName = 'latino'
-
-        self._outputRootFile = 'myhistos.root'
-
-        self._script_batch_location = './scripts_snapshot_batch/'
-
-        self._scripts_run_folder = "scripts_snapshot_run"
-
-
-        self._variables_to_dump           = []
-        self._cut_to_dump                 = ''
-        self._folder_where_to_save_trees  = ''
-
-
-        # conditions
-        self._silentMode = False
-
-
+        super().__init__()
+        self._variables_to_dump          = []
+        self._cut_to_dump                = ''
+        self._folder_where_to_save_trees = ''
+        self._scripts_run_folder         = 'scripts_snapshot_run'
+        self._script_batch_location      = './scripts_snapshot_batch/'
+        self._metadata                   = None
 
     # _____________________________________________________________________________
-    def __del__(self):
-        pass
-
-
-    # _____________________________________________________________________________
-    def unroll_cuts(self):
-
-      temp_cuts = {}
-
-      for cutName, cut in self._cuts.items():
-        #
-        # cuts could be nested, i.e. cut -> categories
-        # here is where you exploit the full power of RDataFrame
-        #
-        # Procedure:
-        # - check if categories
-        # - if yes, then define the cuts in a nested way
-        # - otherwise if "expr" is defined use it
-        #   if note use directly "cut"
-        #
-        # Different possibilities:
-        #
-        # cut["DY"] = "mll>50 && mll<120"
-        # cut["DY"] = {   'expr': 'mll>70 && mll<110' }
-        # cut["DY"] = {
-        #    'expr': 'mll>70 && mll<110',
-        #    'categories' : {
-        #       'eleele' : 'ee',   # "ee" is defined in aliases.py
-        #       'mumu'   : 'mm',   # "mm" is defined in aliases.py
-        #      }
-        #    }
-        #
-
-
-        list_cuts = {}
-        if isinstance(cut, dict):
-          # "cut" is a dictionary
-          expression = cut['expr']
-          categories = cut.get('categories', {})
-          if categories :
-            temp_cuts[ cutName ] = "(" + expression + ")"   # add the un-categorized phase space too! it comes "for free"
-            for category_name, category in categories.items():
-              temp_cuts[ cutName + "_" + category_name] = "(" + expression + ") && (" + category + ")"
-          else :
-            temp_cuts[ cutName ] = expression
-        else :
-          temp_cuts[ cutName ] = cut
-
-      self._cuts = temp_cuts
-
-
+    def setSnapshotValues(self, variables_to_dump, cut_to_dump, folder_where_to_save_trees):
+        self._variables_to_dump          = variables_to_dump
+        self._cut_to_dump                = cut_to_dump
+        self._folder_where_to_save_trees = os.path.abspath(
+            os.path.expandvars(folder_where_to_save_trees))
+        meta_path = os.path.join(self._folder_where_to_save_trees, 'snapshot_metadata.json')
+        self._metadata = SnapshotMetadata(meta_path)
 
     # _____________________________________________________________________________
-    #                                                              "file_path" is a list of root files!
-    def create_cpp_source_list_of_files(self, output_name, tree_name, file_path, output_root_file_name, sampleName, weight,
-                                        aliases_to_be_defined, functions_to_be_defined):
+    def job_prefix(self):
+        return "my_snapshot"
 
-        # This is your C++ template as a Python string
+    def output_file_name(self, sampleName, subname, i):
+        return f"nanoLatino_snapshot____{sampleName}_{subname}_{i}.root"
 
-        define_input_files_logic = ""
+    def _output_file_from_suffix(self, sampleName, subname, suffix):
+        return os.path.join(self._folder_where_to_save_trees,
+                            f"nanoLatino_snapshot____{suffix}.root")
 
-        define_input_files_logic += f"//  Nominal input files\n"
+    # _____________________________________________________________________________
+    #  Variables to dump — with auto-collection of cut vars, alias vars, weight nuisances
+    # _____________________________________________________________________________
 
-        define_input_files_logic += f'    auto* nominal = new TChain("{tree_name}");\n'
+    def _build_full_variables_to_dump(self, aliases_ordered, nuisances):
+        """
+        Build the complete list of variables to save in the snapshot:
+        - explicit variables_to_dump from snapshot.py
+        - my_sample_weight (always)
+        - weight nuisance branches (my_sample_weight_<name>Up/Down)
+        - cut variables (branches used in cut expressions)
+        - simple expr aliases (auto-added)
+        """
+        vtd = list(self._variables_to_dump)
 
-        for file_name in file_path:
-          define_input_files_logic += f'    nominal->Add("{file_name}");\n'
+        # always include my_sample_weight
+        if 'my_sample_weight' not in vtd:
+            vtd = ['my_sample_weight'] + vtd
 
+        # weight nuisances as extra branches
+        weight_nuisance_branches = []
+        for nuisanceName, nuisance in nuisances.items():
+            if nuisance.get('type') == 'shape' and nuisance.get('kind') == 'weight':
+                wUp   = f'my_sample_weight_{nuisanceName}Up'
+                wDown = f'my_sample_weight_{nuisanceName}Down'
+                if wUp   not in vtd: vtd.append(wUp);   weight_nuisance_branches.append(wUp)
+                if wDown not in vtd: vtd.append(wDown);  weight_nuisance_branches.append(wDown)
 
-        define_input_files_logic += f'    ROOT::RDataFrame base_df(*nominal);\n'
-        define_input_files_logic += f'    auto varied_df = ROOT::RDF::RNode(base_df);\n'
+        # cut variables
+        cut_vars = _collect_cut_variables(self._cuts)
+        for v in cut_vars:
+            if v not in vtd:
+                vtd.append(v)
 
-        #
-        # define the weights needed for this specific sample
-        #
-        define_weights = ""
-        define_weights += f"//  weigths needed\n"
-        define_weights += f'    varied_df = SafeDefine(varied_df, "my_sample_weight", "{weight}");\n'
+        # simple expr aliases
+        for aliasName, (kind, payload) in aliases_ordered.items():
+            if kind == 'expr' and aliasName not in vtd:
+                vtd.append(aliasName)
 
-        #
-        # define the aliases needed for this specific sample
-        #
-        define_aliases = ""
-        define_aliases += f"//  aliases/define needed\n"
+        return vtd, weight_nuisance_branches
 
-        for aliasName, alias in aliases_to_be_defined.items():
-          define_aliases += f'    varied_df = SafeDefine(varied_df, "{aliasName}", "{alias}");\n'
+    # _____________________________________________________________________________
+    #  C++ weight nuisance defines
+    # _____________________________________________________________________________
 
+    def _build_weight_nuisance_defines(self, sampleName, weight, nuisances):
+        """Generate SafeDefine calls for weight nuisance branches."""
+        out = ""
+        for nuisanceName, nuisance in nuisances.items():
+            if (nuisance.get('type') == 'shape'
+                    and nuisance.get('kind') == 'weight'
+                    and sampleName in nuisance.get('samples', {})):
+                samples_entry = nuisance['samples'][sampleName]
+                if len(samples_entry) == 3:
+                    if samples_entry[0] in weight:
+                        var_up = weight.replace(samples_entry[0], samples_entry[1])
+                        var_do = weight.replace(samples_entry[0], samples_entry[2])
+                    else:
+                        continue
+                else:
+                    var_up = f"({weight}) * {samples_entry[0]}"
+                    var_do = f"({weight}) * {samples_entry[1]}"
+                out += f'    varied_df = SafeDefine(varied_df, "my_sample_weight_{nuisanceName}Up",   "{var_up}");\n'
+                out += f'    varied_df = SafeDefine(varied_df, "my_sample_weight_{nuisanceName}Down", "{var_do}");\n'
+        return out
 
-        #
-        # define the aliases and functions needed for this specific sample
-        #
-        code_of_function_to_include = ""
+    # _____________________________________________________________________________
+    #  Cuts + snapshot — the mkSnapshot-specific output fragment
+    # _____________________________________________________________________________
 
-        define_aliases_functions = ""
-        define_aliases_functions += f"//  aliases of functions\n"
+    def _unroll_cuts(self):
+        temp_cuts = {}
+        for cutName, cut in self._cuts.items():
+            if isinstance(cut, dict):
+                expression = cut['expr']
+                categories = cut.get('categories', {})
+                if categories:
+                    temp_cuts[cutName] = "(" + expression + ")"
+                    for cat_name, cat in categories.items():
+                        temp_cuts[cutName + "_" + cat_name] = "(" + expression + ") && (" + cat + ")"
+                else:
+                    temp_cuts[cutName] = expression
+            else:
+                temp_cuts[cutName] = cut
+        self._cuts = temp_cuts
 
-        # not SafeDefine since these are new variables ... make it so!
-        for aliasName, alias in functions_to_be_defined.items():
-          if 'external' in alias.keys():
-            with open(alias["external"], "r") as file: # this is the file with the c++ code to be included
-              code_of_function_to_include += file.read()
-          code_of_function_to_include += "\n"
+    def _build_cpp_cuts_and_output(self, sampleName):
+        self._unroll_cuts()
+        out = ""
+        if self._cut_to_dump not in self._cuts:
+            print(f"  WARNING: cut_to_dump='{self._cut_to_dump}' not found in cuts.")
+            return out
 
-          define_aliases_functions += "    varied_df = varied_df"
+        this_cut = self._cuts[self._cut_to_dump]
+        out += f'\n    auto node_{self._cut_to_dump} = current_node.Filter("{this_cut}", "{self._cut_to_dump}");\n\n'
 
-          if 'xmlfile' not in alias.keys(): # if "xmlfile" is present, it's a TMVA and it requires casting to float
-            for i, var in enumerate(alias["variables"]):
-              define_aliases_functions += f'\n                     .Define("_var_{aliasName}_{i}", "{var}")'
-          # if "xmlfile" is present, it's a TMVA
-          elif 'xmlfile' in alias.keys():
-            for i, var in enumerate(alias["variables"]):
-              define_aliases_functions += f'\n                     .Define("_var_{aliasName}_{i}_f", "(float){var}")'
+        columns_str = ", ".join([f'"{v}"' for v in self._current_variables_to_dump])
+        out += f'    std::vector<std::string> requested = {{{columns_str}}};\n'
+        out += f'    std::vector<std::string> existing = node_{self._cut_to_dump}.GetColumnNames();\n'
+        out += f'    std::vector<std::string> columns_to_save;\n'
+        out += f'    for (const auto& col : requested) {{\n'
+        out += f'      if (std::find(existing.begin(), existing.end(), col) != existing.end())\n'
+        out += f'        columns_to_save.push_back(col);\n'
+        out += f'    }}\n\n'
+        return out
 
-          define_aliases_functions += ";\n"
+    # _____________________________________________________________________________
+    #  create_cpp_source_list_of_files
+    # _____________________________________________________________________________
 
-          # if a simple c++ function
-          if 'xmlfile' not in alias.keys():
-            define_aliases_functions += f'\n'
-            new_names = [f"_var_{aliasName}_{i}" for i in range(len(alias["variables"]))]
-            sintax_variables = '{ "' + '", "'.join(new_names) + '" }'
-            define_aliases_functions += f'    varied_df = varied_df.Define("{aliasName}", {alias["function"]}, {sintax_variables} );\n'
-            define_aliases_functions += f'\n'
-          # if "xmlfile" is present, it's a TMVA
-          elif 'xmlfile' in alias.keys():
-            define_aliases_functions += f'\n'
-            submission_dir = os.getcwd()
-            define_aliases_functions += f'''    TMVA::Experimental::RReader my_model_{aliasName}("{submission_dir}/{alias['xmlfile']}");\n'''
+    def create_cpp_source_list_of_files(self, output_name, tree_name, file_path,
+                                         output_root_file_name, sampleName, weight,
+                                         aliases_to_be_defined, functions_to_be_defined,
+                                         aliases_ordered=None,
+                                         range_start=None, range_end=None,
+                                         extra_weight_defines=""):
+        frags = self._build_cpp_common(tree_name, file_path, sampleName, weight,
+                                       aliases_ordered or {}, range_start, range_end)
 
-            new_names = [f"_var_{aliasName}_{i}_f" for i in range(len(alias["variables"]))]
-            sintax_variables = '{ "' + '", "'.join(new_names) + '" }'
+        mt_setting = "ROOT::DisableImplicitMT();" if (range_start is not None and range_end is not None) else "ROOT::EnableImplicitMT();"
 
-            define_aliases_functions += f'''    varied_df = varied_df.Define("{aliasName}",
-                     TMVA::Experimental::Compute<{len(alias['variables'])}, float>(my_model_{aliasName}),
-                     {sintax_variables});\n'''
-            define_aliases_functions += f'\n'
-
-
-        booking_logic = ""
-
-        #
-        # In RDataFrame, all variables must be defined before being plotted/used
-        # The pro of this is that they can be used also in cuts
-        #
-        #
-        # In case of already defined variables, for example "mll", and "mll" is already defined in the TTree,
-        # the code "SafeDefine" should handle this, and "Define" a variable only when needed
-        #
-
-        booking_logic += f"//  Initial ...\n"
-        booking_logic += f'    auto current_node = ROOT::RDF::RNode(varied_df);\n'
-
-
-        define_variables_logic = ""
-        define_variables_logic += f"//  I need to define the RNode, otherwise SafeDefine will not work\n"
-        define_variables_logic += f"    // Define variables \n"
-        for variableName, variable in self._variables.items():
-          if 'is2d' in variable.keys() and variable['is2d'] == 1:
-            pass
-          else:
-            # only for 1D variables
-            name = variable['name']
-            define_variables_logic += f'    current_node = SafeDefine(current_node, "{variableName}", "{name}");\n'
-
-        #
-        # if "supercut" is defined, use it to speed up
-        #
-        if self._supercut != '' :
-          define_variables_logic += f'    current_node = current_node.Filter("{self._supercut}", "supercut");\n'
-
-
-        # remove nested definition of cuts
-        self.unroll_cuts()
-
-        define_snapshot_logic = ''
-        # check if the cut to dump is in the list
-        if self._cut_to_dump in self._cuts.keys() :
-
-          this_cutName = self._cut_to_dump
-          this_cut = self._cuts[self._cut_to_dump]
-
-          define_variables_logic += f'\n'
-          define_variables_logic += f'    auto node_{this_cutName} = current_node.Filter("{this_cut}", "{this_cutName}");\n'
-          define_variables_logic += f'\n'
-
-          # save only the columns that exist, e.g. if data there is no "promptgenmatched"
-          columns_str = ", ".join([f'"{v}"' for v in self._variables_to_dump])
-          define_variables_logic += f'    std::vector<std::string> requested = {{{columns_str}}};\n'
-          define_variables_logic += f'    std::vector<std::string> existing = node_{this_cutName}.GetColumnNames();\n'
-          define_variables_logic += f'    std::vector<std::string> columns_to_save;\n'
-          define_variables_logic += f'    for (const auto& col : requested) {{                                          \n'
-          define_variables_logic += f'      if (std::find(existing.begin(), existing.end(), col) != existing.end()) {{  \n'
-          define_variables_logic += f'        columns_to_save.push_back(col);                                           \n'
-          define_variables_logic += f'      }}                                                                          \n'
-          define_variables_logic += f'    }}                                                                            \n'
-          define_variables_logic += f'\n'
-
-          define_snapshot_logic += f'node_{this_cutName}.Snapshot("Events", "{output_root_file_name}", columns_to_save);   \n'
-
-
+        snapshot_call = f'node_{self._cut_to_dump}.Snapshot("Events", "{output_root_file_name}", columns_to_save);\n'
 
         cpp_code = f"""
 #include "ROOT/RDataFrame.hxx"
 #include "ROOT/RDFHelpers.hxx"
 #include "ROOT/RVec.hxx"
-
 #include "TFile.h"
 #include "TH1D.h"
 #include "TDirectory.h"
@@ -315,556 +296,444 @@ class SnapshotFactory:
 #include <iostream>
 #include <string>
 #include <typeinfo>
-
-
 #include "TMVA/RReader.hxx"
 #include "TMVA/RInferenceUtils.hxx"
 
-
 ROOT::RDF::RNode SafeDefine(ROOT::RDF::RNode df, std::string name, std::string expr) {{
     auto colNames = df.GetColumnNames();
-    if (std::find(colNames.begin(), colNames.end(), name) == colNames.end()) {{
+    if (std::find(colNames.begin(), colNames.end(), name) == colNames.end())
         return df.Define(name, expr);
-    }}
     return df;
 }}
 
+{frags['lines_to_add']}
 
+{frags['code_of_function_to_include']}
 
-// --- Automatically generated: code to be added for additional functions ---
-
-{code_of_function_to_include}
-
-// ----------------------------------------
-
-
-
+{frags['lines_to_global']}
 
 int main() {{
-    ROOT::EnableImplicitMT();
+    {mt_setting}
 
-    // --- Automatically generated input root files ---
+    {frags['lines_to_process']}
 
-    {define_input_files_logic}
+    {frags['define_input_files_logic']}
 
-    // ----------------------------------------
+    {frags['define_aliases']}
 
-    // --- Automatically generated define aliases ---
+    {frags['define_weights']}
 
-    {define_aliases}
+    // --- weight nuisance branches ---
+    {extra_weight_defines}
 
-    // ----------------------------------------
+    {frags['booking_logic']}
 
+    {frags['define_variables_logic']}
 
-    // --- Automatically generated define aliases for functions, no JIT ---
-
-    {define_aliases_functions}
-
-    // ----------------------------------------
-
-
-    // --- Automatically generated define weights ---
-
-    {define_weights}
-
-    // ----------------------------------------
-
-
-    // ----------------------------------------
-
-    // --- Automatically generated ... just the main node ---
-
-    {booking_logic}
-
-    //
-    // from now on: current_node
-    // ----------------------------------------
-
-    // --- Automatically generated define cuts what to snapshot ---
-
-    {define_variables_logic}
-
-    // ----------------------------------------
-
-
-    // --- Automatically generated: perform snapshot ---
-
-    {define_snapshot_logic}
-
-    // ----------------------------------------
-
+    {snapshot_call}
 
     return 0;
 }}
-
-        """
-
-
+"""
         with open(f"{output_name}.cpp", "w") as f:
             f.write(cpp_code)
 
-
     # _____________________________________________________________________________
-    def generate_makefile(self, file_paths, makefile_name):
-        # Get ROOT configuration via shell calls
+    #  generate_makefile (standalone — no liblibrary_utils)
+    # _____________________________________________________________________________
+
+    def generate_makefile(self, file_paths, makefile_name="MakefileSnapshot"):
         cpp_flags = "$(shell root-config --cflags)"
-        ld_flags = "$(shell root-config --libs) -lTMVA -lXMLIO"  # why TMVA is not by default?!?
-        type_of_compilation = "-O2"
-        # from "blabla.cpp" to "blabla"
-        targets = [os.path.splitext(f)[0] for f in file_paths]
-
+        ld_flags  = "$(shell root-config --libs) -lTMVA -lXMLIO"
+        targets   = [os.path.splitext(f)[0] for f in file_paths]
         with open(makefile_name, "w") as f:
-            f.write("# Generated Makefile\n")
-            f.write("CXX = g++\n")
-            # f.write(f"CXXFLAGS = {type_of_compilation} -Wall {cpp_flags} -std=c++20 -Wcpp \n")  # c++20 used for "ends_with"
-            f.write(f"CXXFLAGS = {type_of_compilation} -Wall {cpp_flags} \n")
+            f.write("# Generated MakefileSnapshot\nCXX = g++\n")
+            f.write(f"CXXFLAGS = -O2 -Wall {cpp_flags}\n")
             f.write(f"LDFLAGS = {ld_flags}\n\n")
-
-            # 'all' target: the list of all executables to be created
             all_targets = " ".join(targets)
             f.write(f"all: {all_targets}\n\n")
-
-            # The Pattern Rule
-            # This says: To create ANY executable 'X', look for 'X.cpp'
-            # It works across subdirectories automatically.
-            f.write("%: %.cpp\n")
-            f.write("\t$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)\n\n")
-
-            # Clean target
+            f.write("%: %.cpp\n\t$(CXX) $(CXXFLAGS) $< -o $@ $(LDFLAGS)\n\n")
             f.write("clean:\n")
-            f.write(f"\trm -f {all_targets}\n")
-
-
-
+            f.write(f"\tfind {self._scripts_run_folder} -type f ! -name '*.cpp' ! -name '*.h' -delete\n")
 
     # _____________________________________________________________________________
-    def setValues(self, variables, cuts, supercut, samples , aliases, variables_to_dump, cut_to_dump, folder_where_to_save_trees):
-
-        self._variables = variables
-        self._samples   = samples
-        self._cuts      = cuts
-        self._supercut  = supercut
-        self._aliases   = aliases
-
-        self._variables_to_dump           = variables_to_dump
-        self._cut_to_dump                 = cut_to_dump
-        self._folder_where_to_save_trees  = folder_where_to_save_trees
-
-
+    #  makeScripts — nominal run
     # _____________________________________________________________________________
-    def setConditions(self, silentMode):
 
-        self._silentMode = silentMode
+    def makeScripts(self, patch_mode=False, force=False):
+        print("=====================\n==== makeScripts ====\n=====================")
+        if patch_mode:
+            print("  -> PATCH MODE: adding missing variables to existing snapshots")
 
+        os.makedirs(self._folder_where_to_save_trees, exist_ok=True)
+        os.makedirs(self._scripts_run_folder, exist_ok=True)
 
-    # _____________________________________________________________________________
-    def makeScripts(self):
-
-        print ("=====================")
-        print ("==== makeScripts ====")
-        print ("=====================")
-
-        os.system ("mkdir " + self._folder_where_to_save_trees + "/")
-
-        os.system ("mkdir " + self._scripts_run_folder + "/")
+        self._pre_count_events()
 
         list_of_files_to_compile = []
 
-        # print ("length of samples = ", len(self._samples))
-        #
-        # Loop over samples
-        #
         for sampleName, sample in self._samples.items():
-          os.system ("mkdir " + self._scripts_run_folder + "/" + sampleName + "/")
-          #
-          # create an executable for each file in each sample
-          #
-          # samples is a dictionary: {'subname' : [list of root files] }
-          #
+            os.makedirs(self._scripts_run_folder + "/" + sampleName, exist_ok=True)
 
-          global_weight = sample['weight'] if 'weight' in sample.keys() else "1."
+            global_weight   = sample.get('weight', "1.")
+            weights_subname = sample.get('weights', {})
+            if 'isData' not in sample:
+                global_weight = f"({global_weight}) * {self._lumi}"
 
-          # weight per "sub-dataset"
-          weights_subname = sample['weights'] if 'weights' in sample.keys() else {}
+            _, _, aliases_ordered = self._build_aliases_ordered(sampleName)
 
+            # build full variables list (auto-adds cut vars, alias vars, weight nuisances)
+            full_vtd, weight_nuisance_branches = self._build_full_variables_to_dump(
+                aliases_ordered, self._nuisances)
+            self._current_variables_to_dump = full_vtd
 
-          #
-          # check if "isData". If NOT isData then multiply by lumi otherwise no
-          #
-          if 'isData' in sample.keys() :
-            if not (len(sample ['isData']) == 1 and sample ['isData'][0] == 'all') :
-              # if you put 'all', all the root files are considered "data"
-              # ok, it's data ... and so now?
-              #
-              pass
-          else : # default is "scale to luminosity"
-            global_weight = f"({global_weight}) * {self._lumi}"
+            # weight nuisance defines for this sample
+            extra_weight_defines = self._build_weight_nuisance_defines(
+                sampleName, global_weight, self._nuisances)
 
+            for subname, list_root_files in sample['name'].items():
+                print(f"  {sampleName}/{subname}: {len(list_root_files)} files")
+                os.makedirs(self._scripts_run_folder + "/" + sampleName + "/" + subname, exist_ok=True)
 
-          #
-          # check if additional "Define" is needed, from "alises"
-          #
-          aliases_to_be_defined = {}
-          functions_to_be_defined = {}
-          for aliasName, alias in self._aliases.items():
-            if 'samples' in alias.keys():
-              if sampleName in alias['samples'] and 'expr' in alias.keys():
-                aliases_to_be_defined[aliasName] = alias['expr']
-              if sampleName in alias['samples'] and 'function' in alias.keys():
-                functions_to_be_defined[aliasName] = alias
+                weight = (f"({global_weight}) * ({weights_subname[subname]})"
+                          if subname in weights_subname else global_weight)
 
+                chunks = self._get_chunks(sample, list_root_files)
+                print(f"  -> {len(chunks)} jobs")
 
-          for subname, list_root_files in sample['name'].items():
-            print ("length of list_root_files = ", len(list_root_files))
-            os.system ("mkdir " + self._scripts_run_folder + "/" + sampleName + "/" + subname + "/")
+                for i, chunk in enumerate(chunks):
+                    job_key  = f"{sampleName}_{subname}_{i}"
+                    out_file = self.output_file_name(sampleName, subname, i)
+                    out_path = os.path.join(self._folder_where_to_save_trees, out_file)
 
-            # if weights per subname are listed, use them
-            # e.g. per PD weights in data
-            #
-            if subname in weights_subname.keys():
-              weight = f"({global_weight}) * ({weights_subname[subname]})"
-            else :
-              weight = global_weight
+                    if not force and not patch_mode and self._metadata.is_completed(job_key, out_path):
+                        print(f"    -> {job_key} already done, skipping")
+                        continue
 
-            #
-            # Merge together different root files in one single job, not to have billions of jobs :)
-            #
-            make_job_every_N = 1
-            if "FilesPerJob" in sample.keys():
-              make_job_every_N = sample['FilesPerJob']
-            #
-            # create a list of lists of root files, one per job to be submitted
-            # [ [root1, root2, root3], [root4, root5]]
-            #
-            chunks_list_root_files = [list_root_files[i:i + make_job_every_N] for i in range(0, len(list_root_files), make_job_every_N)]
+                    name_code = (self._scripts_run_folder + "/" + sampleName + "/" + subname
+                                 + "/" + self.job_prefix() + "_" + sampleName + "_" + subname + "_" + str(i))
 
-            for i, root_files in enumerate(chunks_list_root_files):
-              name_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/" + "my_snapshot_" + sampleName + "_" + subname + "_" + str(i)
-              tree = "Events"
+                    if patch_mode:
+                        # determine missing variables
+                        missing = self._metadata.missing_variables(full_vtd)
+                        if not missing:
+                            print(f"    -> {job_key} nothing to patch")
+                            continue
+                        # can we patch from snapshot or need nanoAOD?
+                        if self._metadata.can_patch_from_snapshot(missing):
+                            print(f"    -> {job_key} patch from snapshot ({len(missing)} new vars)")
+                            input_files = [out_path]  # read existing snapshot
+                            patch_suffix = f"_patch{len(self._metadata.get('patches', []))}"
+                            patch_out    = self.output_file_name(sampleName, subname, i).replace('.root', f'{patch_suffix}.root')
+                            self._current_variables_to_dump = missing
+                        else:
+                            print(f"    -> {job_key} patch requires nanoAOD (missing deps)")
+                            input_files = chunk['files']
+                            patch_out   = out_file
+                    else:
+                        input_files = chunk['files']
+                        patch_out   = out_file
 
-              output_root_file_name = "nanoLatino_snapshot____" + sampleName + "_" + subname + "_" + str(i) + ".root"
+                    self.create_cpp_source_list_of_files(
+                        name_code, "Events", input_files,
+                        patch_out if patch_mode else out_file,
+                        sampleName, weight,
+                        {}, {}, aliases_ordered=aliases_ordered,
+                        range_start=chunk.get('range_start'), range_end=chunk.get('range_end'),
+                        extra_weight_defines=extra_weight_defines)
 
-              self.create_cpp_source_list_of_files(name_code, tree, root_files, output_root_file_name, sampleName, weight,
-                                                   aliases_to_be_defined, functions_to_be_defined)
+                    list_of_files_to_compile.append(name_code + ".cpp")
 
-              list_of_files_to_compile.append(name_code)
+        # update metadata
+        self._metadata.set('cut_to_dump',     self._cut_to_dump)
+        self._metadata.set('cut_expression',  self._cuts.get(self._cut_to_dump, ''))
+        self._metadata.set('cut_variables',   list(_collect_cut_variables(self._cuts)))
+        self._metadata.set('variables_saved', self._current_variables_to_dump)
+        self._metadata.set('alias_dependencies',
+                           _collect_alias_dependencies(aliases_ordered if 'aliases_ordered' in dir() else {}))
+        # track weight nuisances
+        wn = [n for n, nu in self._nuisances.items()
+              if nu.get('type') == 'shape' and nu.get('kind') == 'weight']
+        self._metadata.set('weight_nuisances', wn)
+        # track shape nuisances
+        sn = [n for n, nu in self._nuisances.items()
+              if nu.get('type') == 'shape' and nu.get('kind') in ('suffix', 'suffixFly')]
+        self._metadata.set('shape_nuisances', sn)
+        self._metadata.save()
+        print(f"  -> Metadata saved: {self._metadata._path}")
 
-
-
-        self.generate_makefile(list_of_files_to_compile, "MakefileSnapshot")
-
-        # Run the compilation in parallel
-        print("Start parallel compilation...")
-        subprocess.run(["make", "-f", "MakefileSnapshot", "-j8"])
-        #
-        # subprocess.run() is a blocking call -> it will make the compilation to end before the next step
-        #
-
-
-
+        self.generate_makefile(list_of_files_to_compile)
+        subprocess.run(["make", "-f", "MakefileSnapshot", "clean"])
+        print("Scripts generated. To compile: make -f MakefileSnapshot -j8")
+        print("Or use --localCompile.")
 
     # _____________________________________________________________________________
-    def checkBatch(self):
+    #  makeShapeNuisances — generate alternative TTree files for shape nuisances
+    # _____________________________________________________________________________
 
-        print ("=====================")
-        print ("==== check Batch ====")
-        print ("=====================")
-        print ("\n")
+    def makeShapeNuisances(self):
+        """
+        For each shape nuisance of kind 'suffix', generate a separate snapshot
+        reading the alternative TTree (friend tree in nanoAOD).
+        Output: nanoLatino_snapshot____<sample>_<subname>_<i>_<nuisanceName>Up.root
+        """
+        print("===============================")
+        print("==== makeShapeNuisances    ====")
+        print("===============================")
 
-        submission_dir = os.getcwd()
+        os.makedirs(self._folder_where_to_save_trees, exist_ok=True)
+        os.makedirs(self._scripts_run_folder, exist_ok=True)
 
-        list_jobs_with_error = []
-        list_missing_root_files = []
-        #
-        # Loop over samples
-        #
-        for sampleName, sample in self._samples.items():
-          for subname, list_root_files in sample['name'].items():
-            make_job_every_N = 1
-            if "FilesPerJob" in sample.keys():
-              make_job_every_N = sample['FilesPerJob']
-            chunks_list_root_files = [list_root_files[i:i + make_job_every_N] for i in range(0, len(list_root_files), make_job_every_N)]
-            for i, root_files in enumerate(chunks_list_root_files):
-              name_err_file = self._script_batch_location + "/" + sampleName + "/" + subname + "/log/" + "my_script_" + str(i) + ".sh.err"
-              # print (" name_err_file = ", name_err_file)
-              if os.path.exists(name_err_file):
-                with open(name_err_file, 'r') as f:
-                  line_count = sum(1 for line in f)
-                  if line_count > 1: # should I remove the warnings to have 0? FIXME
-                    list_jobs_with_error.append(name_err_file)
-              output_root_file_name = "nanoLatino_snapshot____" + sampleName + "_" + subname + "_" + str(i) + ".root"
-              root_file_name = f"{self._folder_where_to_save_trees}/{output_root_file_name}"
-              if os.path.exists(root_file_name):
-                pass
-              else :
-                list_missing_root_files.append(root_file_name)
+        self._pre_count_events()
 
+        list_of_files_to_compile = []
 
-        if len(list_jobs_with_error) == 0:
-          print (" No jobs with error ")
-        else :
-          print(" Jobs with errors:")
-          for index, job in enumerate(list_jobs_with_error):
-            print(f"    Job {index}: {job}")
+        for nuisanceName, nuisance in self._nuisances.items():
+            if nuisance.get('type') != 'shape':
+                continue
+            if nuisance.get('kind') not in ('suffix', 'suffixFly'):
+                continue
 
+            print(f"  Nuisance: {nuisanceName}")
 
-        if len(list_missing_root_files) == 0:
-          print (" All files are ready ")
-        else :
-          print(" Missing files:")
-          for index, job in enumerate(list_missing_root_files):
-            print(f"     File: {index}: {job}")
+            for sampleName, sample in self._samples.items():
+                if sampleName not in nuisance.get('samples', {}):
+                    continue
 
+                _, _, aliases_ordered = self._build_aliases_ordered(sampleName)
+                full_vtd, _ = self._build_full_variables_to_dump(aliases_ordered, {})
+                self._current_variables_to_dump = full_vtd
 
+                global_weight   = sample.get('weight', "1.")
+                weights_subname = sample.get('weights', {})
+                if 'isData' not in sample:
+                    global_weight = f"({global_weight}) * {self._lumi}"
 
+                for subname, list_root_files in sample['name'].items():
+                    chunks = self._get_chunks(sample, list_root_files)
 
-    def submitBatch(self):
+                    for i, chunk in enumerate(chunks):
+                        for direction in ['Up', 'Down']:
+                            map_name = nuisance[f'map{direction}']
+                            folder   = nuisance[f'folder{direction}']
 
-        print ("======================")
-        print ("==== submit Batch ====")
-        print ("======================")
+                            # build alternative file list
+                            alt_files = []
+                            for f_path in chunk['files']:
+                                fname = os.path.basename(f_path)
+                                alt_files.append(os.path.join(folder, fname))
 
-        os.system ("mkdir " + self._script_batch_location + "/")
+                            job_name  = (f"my_snapshot_{nuisanceName}{direction}_"
+                                         f"{sampleName}_{subname}_{i}")
+                            out_file  = (f"nanoLatino_snapshot____{sampleName}_{subname}_{i}"
+                                         f"_{nuisanceName}{direction}.root")
+                            name_code = os.path.join(self._scripts_run_folder, sampleName,
+                                                     subname, job_name)
 
-        submission_dir = os.getcwd()
+                            os.makedirs(os.path.dirname(name_code), exist_ok=True)
 
-        #
-        # Loop over samples
-        #
-        for sampleName, sample in self._samples.items():
-          os.system ("mkdir " + self._script_batch_location + "/" + sampleName + "/")
+                            weight = (f"({global_weight}) * ({weights_subname[subname]})"
+                                      if subname in weights_subname else global_weight)
 
-          for subname, list_root_files in sample['name'].items():
-            os.system ("mkdir " + self._script_batch_location + "/" + sampleName + "/" + subname + "/")
+                            self.create_cpp_source_list_of_files(
+                                name_code, "Events", alt_files, out_file,
+                                sampleName, weight,
+                                {}, {}, aliases_ordered=aliases_ordered,
+                                range_start=chunk.get('range_start'),
+                                range_end=chunk.get('range_end'))
 
-            make_job_every_N = 1
-            if "FilesPerJob" in sample.keys():
-              make_job_every_N = sample['FilesPerJob']
-            chunks_list_root_files = [list_root_files[i:i + make_job_every_N] for i in range(0, len(list_root_files), make_job_every_N)]
+                            list_of_files_to_compile.append(name_code + ".cpp")
 
-            for i, root_files in enumerate(chunks_list_root_files):
-              name_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/" + "my_snapshot_" + sampleName + "_" + subname + "_" + str(i)
-              name_code_no_folder = "my_snapshot_" + sampleName + "_" + subname + "_" + str(i)
-              name_bash = self._script_batch_location + "/" + sampleName + "/" + subname + "/" + "my_script_" + str(i) + ".sh"
-              output_root_file_name = "nanoLatino_snapshot____" + sampleName + "_" + subname + "_" + str(i) + ".root"
+        # update metadata
+        sn = [n for n, nu in self._nuisances.items()
+              if nu.get('type') == 'shape' and nu.get('kind') in ('suffix', 'suffixFly')]
+        self._metadata.set('shape_nuisances', sn)
+        self._metadata.save()
 
-              bash_code = f"""#!/bin/bash
-set -e  # Exit on error
-echo "Job started at $(date)"
-echo "Running on node $(hostname)"
-echo "Current full path before running the snapshot: $(pwd)"
-./{name_code_no_folder}
-echo "Current full path after running the snapshot: $(pwd)"
-mv {output_root_file_name}  {self._folder_where_to_save_trees}/
-echo "Current full path after moving the files: $(pwd)"
-echo "Current directory content after running:"
-ls -lh
-echo "Current full path: $(pwd)"
+        self.generate_makefile(list_of_files_to_compile, "MakefileSnapshotNuisances")
+        print("Scripts generated. To compile: make -f MakefileSnapshotNuisances -j8")
 
+    # _____________________________________________________________________________
+    #  haddBatch — hadd all snapshot files into one per tag
+    # _____________________________________________________________________________
+
+    def haddBatch(self, tag, haddnano_path=None):
+        if haddnano_path is None:
+            haddnano_path = os.path.join(_SCRIPTS_DIR, "haddnano.py")
+        super().haddBatch(
+            tag          = tag,
+            output_dir   = self._folder_where_to_save_trees,
+            glob_pattern = "nanoLatino_snapshot____*.root",
+            output_name  = f"snapshot_{tag}.root",
+            hadd_tool_path = haddnano_path,
+            hadd_tool_args = "",   # haddnano doesn't need extra args
+        )
+
+    # _____________________________________________________________________________
+    #  submitBatch hooks
+    # _____________________________________________________________________________
+
+    def _extra_transfer_files_for_submit(self, precompiled, x509_proxy, extra_files_str):
+        return f"{x509_proxy}{extra_files_str}"
+
+    def _build_bash_precompiled(self, job_name, out_file, sampleName, subname,
+                                proxy_lines, submission_dir, root_cflags, root_libs):
+        cp_cmd = self._build_cp_cmd(out_file, self._folder_where_to_save_trees)
+        return f"""#!/bin/bash
+set -e
+echo "Job started at $(date)"; echo "Running on node $(hostname)"
+source /cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh
+{proxy_lines}./{job_name}
+{cp_cmd}
+rm -f {out_file} {job_name}
+echo "Done at $(date)"; ls -lh
 """
 
-#
-# mkdir {self._folder_where_to_save_trees}
-#
-
-              with open(f"{name_bash}", "w") as f:
-                f.write(bash_code)
-                os.system ("chmod +x " + name_bash)
-                # print ("name_bash = ", name_bash)
-
-              name_submit = submission_dir + "/" + self._script_batch_location + "/" + sampleName + "/" + subname + "/" + "my_script_" + str(i) + ".sub"
-              # name_folder = submission_dir + "/" + self._script_batch_location + "/" + sampleName + "/" + subname + "/"
-              name_folder = self._script_batch_location + "/" + sampleName + "/" + subname + "/"
-              name_folder_code = self._scripts_run_folder + "/" + sampleName + "/" + subname + "/"
-              name_bash_no_folder = "my_script_" + str(i) + ".sh"
-
-              if self._silentMode :
-                output_file = "/dev/null"
-                error_file  = "/dev/null"
-                log_file    = "/dev/null"
-              else :
-                output_file = f"log/{name_bash_no_folder}.out"
-                error_file  = f"log/{name_bash_no_folder}.err"
-                log_file    = f"log/{name_bash_no_folder}.log"
-
-
-              submit_code = f"""
-initialdir            = {name_folder}
-executable            = {name_bash}
-transfer_input_files  = {submission_dir}/{name_folder_code}{name_code_no_folder}
-should_transfer_files   = YES
-when_to_transfer_output = ON_EXIT
-output                = {output_file}
-error                 = {error_file}
-log                   = {log_file}
-getenv                = True
-+JobFlavour           = "longlunch"
-queue
+    def _build_bash_compile_on_node(self, job_name, out_file, sampleName, subname,
+                                    proxy_lines, submission_dir, root_cflags, root_libs):
+        cp_cmd = self._build_cp_cmd(out_file, self._folder_where_to_save_trees)
+        return f"""#!/bin/bash
+set -e
+echo "Job started at $(date)"; echo "Running on node $(hostname)"
+source /cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh
+{proxy_lines}echo "Compiling..."
+g++ -O2 -Wall {root_cflags} \\
+    {job_name}.cpp -o {job_name} \\
+    -lTMVA -lXMLIO \\
+    -I/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/include \\
+    -L/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/lib \\
+    -lcorrectionlib {root_libs}
+echo "Compilation done at $(date)"
+./{job_name}
+{cp_cmd}
+rm -f {out_file} {job_name}
+echo "Done at $(date)"; ls -lh
 """
 
-              with open(f"{name_submit}", "w") as f:
-                f.write(submit_code)
+    # _____________________________________________________________________________
+    #  checkBatch — output file is in folder_where_to_save_trees, not outputDir
+    # _____________________________________________________________________________
 
-              print("Submitting job to HTCondor: condor_submit " + name_submit)
-              subprocess.run(["condor_submit", f"{name_submit}"])
+    def _output_file_from_suffix(self, sampleName, subname, suffix):
+        return os.path.join(self._folder_where_to_save_trees,
+                            f"nanoLatino_snapshot____{suffix}.root")
+
+    def checkBatch(self, resubmit=False):
+        """Override to also mark completed jobs in metadata."""
+        super().checkBatch(resubmit=resubmit)
+        # update metadata with completed files
+        for sampleName in self._samples:
+            sample_dir = os.path.join(self._script_batch_location, sampleName)
+            if not os.path.isdir(sample_dir):
+                continue
+            for subname in os.listdir(sample_dir):
+                subname_dir = os.path.join(sample_dir, subname)
+                if not os.path.isdir(subname_dir):
+                    continue
+                sh_files = sorted(f for f in os.listdir(subname_dir) if f.endswith('.sh'))
+                for sh_file in sh_files:
+                    job_name = sh_file[:-3]
+                    suffix   = job_name.replace(self.job_prefix() + "_", "", 1)
+                    out_path = os.path.join(self._folder_where_to_save_trees,
+                                            f"nanoLatino_snapshot____{suffix}.root")
+                    job_key  = suffix
+                    if os.path.exists(out_path):
+                        self._metadata.mark_completed(job_key, out_path)
+        self._metadata.save()
 
 
-
-
-
-#
-#
+# -----------------------------------------------------------------------
 #  Main
-#
-#
+# -----------------------------------------------------------------------
 
 if __name__ == '__main__':
     sys.argv = argv
 
     header = """
          --------------------------------------------------------------------------------------------------
-         '                                                                                                '
          '      ___|                              |             |         \\  |         |                  '
          '    \\___ \\   __ \\    _` |  __ \\    __|  __ \\    _ \\   __|      |\\/ |   _` |  |  /   _ \\   __|   '
          '          |  |   |  (   |  |   | \\__ \\  | | |  (   |  |        |   |  (   |    <    __/  |      '
          '    _____/  _|  _| \\__,_|  .__/  ____/ _| |_| \\___/  \\__|     _|  _| \\__,_| _|\\_\\ \\___| _|      '
-         '                          _|                                                                    '
-         '                                                                                                '
          --------------------------------------------------------------------------------------------------
-         """
-
+    """
     print(header)
 
     parser = defaultParser()
-
-    parser.add_argument("--submitBatch", action='store_true', dest="submitBatch",   help="Trigger the submission to lxbatch")
-    parser.add_argument("--checkBatch",  action='store_true', dest="checkBatch",    help="Check if jobs are done succesfully")
-
+    parser.add_argument("--localCompile",    action='store_true', dest="localCompile")
+    parser.add_argument("--submitBatch",     action='store_true', dest="submitBatch")
+    parser.add_argument("--checkBatch",      action='store_true', dest="checkBatch")
+    parser.add_argument("--resubmit",        action='store_true', dest="resubmit")
+    parser.add_argument("--silentMode",      action='store_true', dest="silentMode")
+    parser.add_argument("--haddBatch",       action='store_true', dest="haddBatch",
+                        help="Submit a single condor job to hadd all snapshot files")
+    parser.add_argument("--patch",           action='store_true', dest="patch",
+                        help="Add missing variables to existing snapshots")
+    parser.add_argument("--shapeNuisances",  action='store_true', dest="shapeNuisances",
+                        help="Generate alternative TTree files for shape nuisances")
+    parser.add_argument("--force",           action='store_true', dest="force",
+                        help="Force regeneration even if already done")
 
     opt = parser.parse_args()
-    print ("opt.pycfg            = ", opt.pycfg)
     loadDefaultOptions(parser, opt.pycfg)
     opt = parser.parse_args()
 
+    cfg = load_config_files(opt)
+    samples   = cfg['samples']
+    variables = cfg['variables']
+    cuts      = cfg['cuts']
+    supercut  = cfg['supercut']
+    aliases   = cfg['aliases']
+    nuisances = cfg['nuisances']
 
-    print ("opt.submitBatch      = ", opt.submitBatch)
-    print ("opt.checkBatch       = ", opt.checkBatch)
+    # snapshot.py
+    snap_ns = {**_base_ns(), 'samples': samples, 'cuts': cuts, 'aliases': aliases,
+               'variables_to_dump': [], 'cut_to_dump': '', 'folder_where_to_save_trees': ''}
+    if hasattr(opt, 'snapshotFile') and os.path.exists(opt.snapshotFile):
+        with open(opt.snapshotFile, 'r') as fh:
+            exec(fh.read(), snap_ns)
+    variables_to_dump = snap_ns.get('variables_to_dump', [])
+    cut_to_dump       = snap_ns.get('cut_to_dump', '')
 
-
-    variables_to_dump = []
-
-
-    #
-    # logic of dependencies:
-    #
-    #    samples.py
-    #      --> aliases.py     since the aliases/defines will be "Defined" only for selected samples
-    #    cuts.py
-    #    variables.py
-    #    snapshot.py
-    #
-
-
-    #
-    # read list of samples
-    #
-    samples = {}
-    if os.path.exists(opt.samplesFile) :
-      handle = open(opt.samplesFile,'r')
-      exec(handle.read())
-      handle.close()
-      # clean the dictionary to remove globals due to "exec" funcionality
-      samples = {k: v for k, v in samples.items() if not (k.startswith('__') and k.endswith('__'))}
-
-    # print ("samples = ", samples)
-
-    #
-    # read list of variables
-    #
-    variables = {}
-    if os.path.exists(opt.variablesFile) :
-      handle = open(opt.variablesFile,'r')
-      exec(handle.read())
-      handle.close()
-      # clean the dictionary to remove globals due to "exec" funcionality
-      variables = {k: v for k, v in variables.items() if not (k.startswith('__') and k.endswith('__'))}
-
-    print ("variables = ", variables)
-
-
-    #
-    # read list of cuts
-    #
-    cuts = {}
-    supercut = ''
-    if os.path.exists(opt.cutsFile) :
-      handle = open(opt.cutsFile,'r')
-      exec(handle.read())
-      handle.close()
-      # clean the dictionary to remove globals due to "exec" funcionality
-      cuts = {k: v for k, v in cuts.items() if not (k.startswith('__') and k.endswith('__'))}
-
-    print ("cuts = ", cuts)
-    print ("supercut = ", supercut)
-
-
-
-    #
-    # read list of aliases
-    #
-    aliases = {}
-    if os.path.exists(opt.aliasesFile) :
-      handle = open(opt.aliasesFile,'r')
-      exec(handle.read())
-      handle.close()
-      # clean the dictionary to remove globals due to "exec" funcionality
-      aliases = {k: v for k, v in aliases.items() if not (k.startswith('__') and k.endswith('__'))}
-
-    print ("aliases = ", aliases)
-
-
-
-    #
-    # read configuration for the snapshot
-    #
-    variables_to_dump = []
-    cut_to_dump = ''
-    folder_where_to_save_trees = ''
-
-    if os.path.exists(opt.snapshotFile) :
-      handle = open(opt.snapshotFile,'r')
-      exec(handle.read())
-      handle.close()
-
-    print ("variables_to_dump = ", variables_to_dump)
-    print ("cut_to_dump = ", cut_to_dump)
-    print ("folder_where_to_save_trees = ", folder_where_to_save_trees)
-
-
-
+    folder_where_to_save_trees = snap_ns.get('folder_where_to_save_trees', '') or \
+                                 getattr(opt, 'folder_where_to_save_trees', '') or \
+                                 os.path.join(os.path.expandvars(opt.outputDir), 'snapshot')
+    folder_where_to_save_trees = os.path.expandvars(folder_where_to_save_trees)
 
     factory = SnapshotFactory()
-    factory.setValues( variables, cuts, supercut, samples , aliases, variables_to_dump, cut_to_dump, folder_where_to_save_trees)
+    factory.setValues(
+        folder_where_to_save_trees,
+        variables, cuts, supercut, samples, nuisances, aliases, getattr(opt, 'lumi', 1),
+        scripts_run_folder    = getattr(opt, 'snapshotRunFolder',   None),
+        script_batch_location = getattr(opt, 'batchScriptLocation', None),
+        extra_transfer_files  = getattr(opt, 'extra_transfer_files', None),
+    )
+    factory.setSnapshotValues(variables_to_dump, cut_to_dump, folder_where_to_save_trees)
+    factory.setConditions(opt.silentMode)
 
-    # factory._treeName  = opt.treeName
-    # factory._energy    = opt.energy
-    # factory._lumi      = opt.lumi
-    # factory._tag       = opt.tag
+    if not any([opt.submitBatch, opt.checkBatch, opt.localCompile,
+                opt.patch, opt.shapeNuisances, opt.haddBatch]):
+        factory.makeScripts(force=opt.force)
 
-    if not opt.submitBatch and not opt.checkBatch:
-      factory.makeScripts()
+    if opt.patch:
+        factory.makeScripts(patch_mode=True, force=opt.force)
 
-    if opt.submitBatch :
-      factory.submitBatch()
+    if opt.shapeNuisances:
+        factory.makeShapeNuisances()
 
-    if opt.checkBatch :
-      print ("Checking if the jobs finished succesfully")
-      factory.checkBatch()
+    if opt.localCompile:
+        factory.makeScripts(force=opt.force)
+        subprocess.run(["make", "-f", "MakefileSnapshot", "-j8"])
 
+    if opt.submitBatch:
+        factory.submitBatch()
 
+    if opt.haddBatch:
+        tag = getattr(opt, 'tag', 'snapshot')
+        haddnano_path = getattr(opt, 'haddnanoPath', None)
+        factory.haddBatch(tag, haddnano_path=haddnano_path)
 
-    print ("\n\n")
-    print (" I'm done ... \n\n")
+    if opt.checkBatch:
+        factory.checkBatch(resubmit=opt.resubmit)
 
-
-
+    print("\n\n I'm done ...\n\n")

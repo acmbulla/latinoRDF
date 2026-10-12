@@ -1509,8 +1509,8 @@ class PlotFactory:
             frameRatio.GetYaxis().SetTitle("Data/Expected")
             #frameRatio.GetYaxis().SetTitle("Data/MC")
             #frameRatio.GetYaxis().SetRangeUser( 0.0, 2.0 )
-            frameRatio.GetYaxis().SetRangeUser( 0.8, 1.2 )
-            # frameRatio.GetYaxis().SetRangeUser( 0.5, 1.5 )
+            # frameRatio.GetYaxis().SetRangeUser( 0.8, 1.2 )
+            frameRatio.GetYaxis().SetRangeUser( 0.5, 1.5 )
             self.Pad2TAxis(frameRatio)
             #                               if there is "histo_total" there is no need of explicit nuisances
             # if (not self._removeMCStat)  or len(mynuisances.keys()) != 0 or histo_total!= None:
