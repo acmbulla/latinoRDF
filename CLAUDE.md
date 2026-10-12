@@ -294,18 +294,61 @@ aliases['fakeW'] = {
 Emission order before `main()` (§3) is `linesToAdd` → `external` →
 `linesToGlobal`, so the class is always defined before the instance.
 
-### Constraint this imposes on helper classes
+### Three constraints the typed `Define` imposes
 
-`variables` entries are **column names only** — the typed `Define` passes
-columns, not literals. Any configuration constant must therefore be a
-**constructor** argument, not an `operator()` argument.
+These bit once each during the conversion. All three are properties of
+`RDataFrame::Define(name, callable, columns)`, not of this framework.
 
-- `fake_rate_reader::operator()` already takes only columns → converts with no
-  C++ change.
-- `btagSFbc` / `btagSFlight::operator()` currently take 6 columns **plus 4
-  string literals** (`WP`, `shift`, `tagger`, `year`). Those four must move
-  into the constructor, which is a real API change to
-  `evaluate_btagSF{bc,light}.cc`.
+**1. No literals — configuration goes in the constructor.** `variables`
+entries become columns, so a configuration constant cannot be an `operator()`
+argument. `btagSFbc` / `btagSFlight` took 6 columns plus 4 strings (`WP`,
+`shift`, `tagger`, `year`); those four moved into the constructor and became
+members. `fake_rate_reader` already took only columns. A useful side effect:
+`cset->at(tagger + ...)` now resolves once per job instead of once per event.
+
+**2. The callable must be copyable.** `Define` takes it **by value**. A
+`std::unique_ptr` member deletes the copy constructor, and a user-declared
+destructor suppresses the implicit move constructor — with both, the class is
+neither copyable nor movable and `Define` will not compile. Use `shared_ptr`
+for owned state and let the destructor go, so copies share it. Check with
+`static_assert(std::is_copy_constructible_v<T>)`.
+
+**3. Column types must match exactly.** This is the one that costs the most
+time. A string `expr` is JIT-compiled by Cling, which converts silently; the
+typed `Define` compares types and throws:
+
+```
+RDataFrame: type mismatch: column "_var_btagSFbc_3" is being used as
+unsigned int but the Define or Vary node advertises it as int
+```
+
+Branch types in these nanoAODs are not what the names suggest, so **pin them
+in `variables`** rather than in the C++ — the branch type belongs to the input
+data and varies by nanoAOD version, while the helper signature is shared by
+every year:
+
+| Branch | Actual type | Note |
+|---|---|---|
+| `nCleanJet` | `Int_t` | *not* `UInt_t`; cast for a helper taking `unsigned int` |
+| `Jet_hadronFlavour` | `RVec<unsigned char>` | `UChar_t` from NanoAODv12 on |
+| `Lepton_isTightMuon_<WP>`, `Lepton_isTightElectron_<WP>` | `RVec<bool>` | cast to `RVec<int>` |
+| `CleanJet_jetIdx` | `RVec<ULong64_t>` | genuinely unsigned 64-bit |
+| `Lepton_muonIdx` | `RVec<int>` | cast kept anyway: only verified on one year |
+| `*_pt`, `*_eta`, `Jet_btag*` | `RVec<float>` | |
+| `Lepton_pdgId` | `RVec<int>` | |
+
+`(unsigned int)nCleanJet` and `ROOT::VecOps::RVec<int>(branch)` both work as
+`variables` expressions; the latter accepts any convertible element type.
+
+To check a file's types before submitting, rather than finding out from a
+crashed job:
+
+```python
+import ROOT
+t = ROOT.TFile.Open(path).Get("Events")
+b = t.GetBranch("Jet_hadronFlavour")
+print(b.GetLeaf("Jet_hadronFlavour").GetTypeName())
+```
 
 ### Forbidden patterns
 
