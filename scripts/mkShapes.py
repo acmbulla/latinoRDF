@@ -1161,7 +1161,8 @@ int main() {{
             tag          = tag,
             output_dir   = self._outputDir,
             glob_pattern = "root_file___*.root",
-            output_name  = f"plots_{tag}.root",
+            # same name as --hadd: mkPlot and mkDatacards look for this file
+            output_name  = "root_file_joined.root",
             hadd_tool_path = haddfast_path,
             hadd_tool_args = "-f -j 8 -E",
         )
