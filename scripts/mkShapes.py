@@ -1160,7 +1160,7 @@ int main() {{
         super().haddBatch(
             tag          = tag,
             output_dir   = self._outputDir,
-            glob_pattern = "root_file___*.root",
+            name_prefix  = "root_file___",
             # same name as --hadd: mkPlot and mkDatacards look for this file
             output_name  = "root_file_joined.root",
             hadd_tool_path = haddfast_path,
@@ -1322,8 +1322,17 @@ if __name__ == '__main__':
                 print(f"  {f}")
             print("Run --checkBatch to get the full picture, --resubmit to resubmit missing jobs.")
         else:
-            hadd_cmd = f"hadd -j 8 -f {opt.outputDir}/root_file_joined.root {opt.outputDir}/root_file___*.root"
-            os.system(hadd_cmd)
+            # the shell glob would also pick up the per-job files of a sample
+            # that samples.py no longer declares, and hadd would add them to
+            # the histograms of the sample that replaced it
+            inputs, orphans = factory.selectOutputFiles(factory._outputDir, "root_file___")
+            factory.reportOrphans(orphans)
+            if not inputs:
+                print("ERROR: no file belongs to a sample declared in samples.py")
+            else:
+                joined = os.path.join(factory._outputDir, "root_file_joined.root")
+                print(f"  -> hadd of {len(inputs)} files into {joined}")
+                subprocess.run(["hadd", "-j", "8", "-f", joined] + inputs)
     if opt.checkBatch:
         factory.checkBatch(resubmit=opt.resubmit)
 
