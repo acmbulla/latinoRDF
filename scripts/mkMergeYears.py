@@ -200,12 +200,27 @@ class MergerFactory:
                print(f"  WARNING: {folder_name} not found in {new_root_file_name}, skipping")
                continue
 
+             # Pick up only the latest version of each histogram (highest key
+             # cycle number). haddfast.py writes a new cycle every time it adds
+             # into an existing histogram, so a file merged with --haddBatch
+             # carries ;1 (the first chunk alone) next to the highest cycle
+             # (the running sum). GetListOfKeys() returns them in *descending*
+             # cycle order, so keying a dict by name and letting the last
+             # iteration win would keep the partial histogram and silently
+             # under-count every sample. Same dedup as haddfast.merge().
+             inkeys = {}
              for k in folder_in_file.GetListOfKeys():
-               h = k.ReadObj()
-               histoName = h.GetName()
+               keyName = k.GetName()
+               if keyName in inkeys and inkeys[keyName].GetCycle() > k.GetCycle():
+                 continue
+               inkeys[keyName] = k
+
+             for histoName, k in inkeys.items():
                match = re.search("histo_", histoName)
                if not match:
                  continue
+
+               h = k.ReadObj()
 
                # [FEATURE] apply sample rename: check if histoName starts with any old histo prefix
                # Handles both nominal (histo_DY) and variations (histo_DY_puWeightup)
