@@ -1164,7 +1164,14 @@ int main() {{
             # same name as --hadd: mkPlot and mkDatacards look for this file
             output_name  = "root_file_joined.root",
             hadd_tool_path = haddfast_path,
-            hadd_tool_args = "-f -j 8 -E",
+            # -C purges the duplicate key cycles haddfast leaves behind. Its
+            # merge step calls TH1::Write() without kOverwrite, so every
+            # histogram that is *added* to an existing one gains a cycle:
+            # ;1 holds the first chunk alone and the highest cycle the running
+            # sum. TFile::Get() resolves to the highest cycle, so mkPlot and
+            # mkDatacards read the right one, but any consumer that iterates
+            # GetListOfKeys() sees all of them, in descending cycle order.
+            hadd_tool_args = "-f -j 8 -E -C",
         )
 
     # _____________________________________________________________________________
