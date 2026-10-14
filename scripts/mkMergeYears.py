@@ -134,6 +134,133 @@ def readFolder(rootFile, folder_name, histo_rename):
     return out
 
 
+#
+# batch splitting: one job per cut
+#
+# The merge touches one output folder, cut/variable, at a time and a folder of
+# one cut never depends on another cut, so the work splits cleanly by cut. Each
+# job writes its own partial file and the partials hold disjoint folders, so
+# hadding them together is a union and cannot double count.
+#
+
+PARTIAL_PREFIX = "root_file_joined___"
+
+
+def partialName(cutName):
+    return PARTIAL_PREFIX + cutName + ".root"
+
+
+def expandedCutNames(cuts):
+    """The cut names the merge will produce, categories unrolled."""
+    names = []
+    for cutName, cut in cuts.items():
+        names.append(cutName)
+        if isinstance(cut, dict):
+            for category_name in cut.get('categories', {}):
+                names.append(cutName + "_" + category_name)
+    return names
+
+
+def checkPartials(outputDir, cutNames):
+    """(missing, present) partial files, by cut name."""
+    missing, present = [], []
+    for c in cutNames:
+        path = os.path.join(outputDir, partialName(c))
+        if os.path.exists(path) and os.path.getsize(path) > 0:
+            present.append(c)
+        else:
+            missing.append(c)
+    return missing, present
+
+
+def submitBatch(pycfg, outputDir, cutNames, batchDir="jobsMerge", jobFlavour="workday"):
+    """Write one condor job per cut and submit them as a single cluster."""
+    import subprocess
+
+    batchDir = os.path.abspath(batchDir)
+    os.makedirs(batchDir, exist_ok=True)
+    outputDir = os.path.abspath(outputDir)
+    os.makedirs(outputDir, exist_ok=True)
+
+    script_path = os.path.abspath(__file__)
+    pycfg_abs = os.path.abspath(pycfg)
+    workdir = os.getcwd()
+
+    sh_path = os.path.join(batchDir, "merge_one_cut.sh")
+    with open(sh_path, "w") as f:
+        f.write(
+            '#!/bin/bash\n'
+            'set -e\n'
+            'CUT=$1\n'
+            'echo "merge job for cut $CUT started at $(date) on $(hostname)"\n'
+            'cd ' + workdir + '\n'
+            'python ' + script_path + ' \\\n'
+            '    --pycfg ' + pycfg_abs + ' \\\n'
+            '    --cut "$CUT" \\\n'
+            '    --output ' + PARTIAL_PREFIX + '"$CUT".root \\\n'
+            '    --silentMode\n'
+            'echo "done at $(date)"\n'
+            'ls -lh ' + outputDir + '/' + PARTIAL_PREFIX + '"$CUT".root\n'
+        )
+    os.system("chmod +x " + sh_path)
+
+    sub_path = os.path.join(batchDir, "submit_merge.sub")
+    with open(sub_path, "w") as f:
+        f.write(
+            '# one merge job per cut\n'
+            'executable              = ' + sh_path + '\n'
+            'arguments               = $(cutname)\n'
+            'output                  = ' + batchDir + '/merge_$(cutname).out\n'
+            'error                   = ' + batchDir + '/merge_$(cutname).err\n'
+            'log                     = ' + batchDir + '/merge_$(cutname).log\n'
+            'getenv                  = True\n'
+            '+JobFlavour             = "' + jobFlavour + '"\n'
+            '\n'
+            'queue cutname in (\n'
+        )
+        for c in cutNames:
+            f.write("  " + c + "\n")
+        f.write(")\n")
+
+    print("  -> job script  : %s" % sh_path)
+    print("  -> submit file : %s" % sub_path)
+    print("  -> %d jobs, one per cut" % len(cutNames))
+    print("  -> partials    : %s/%s<cut>.root" % (outputDir, PARTIAL_PREFIX))
+    print("Submitting...")
+    subprocess.run(["condor_submit", sub_path], cwd=batchDir)
+
+
+def haddPartials(outputDir, cutNames, haddfastPath=None):
+    """Merge the per-cut partials into the versioned root_file_joined.root."""
+    import subprocess
+
+    missing, present = checkPartials(outputDir, cutNames)
+    if missing:
+        print("ERROR: %d partial file(s) missing, refusing to hadd:" % len(missing))
+        for c in missing:
+            print("  %s" % os.path.join(outputDir, partialName(c)))
+        print("Run --checkBatch for the full picture.")
+        return False
+
+    if haddfastPath is None:
+        haddfastPath = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "haddfast.py")
+
+    target = versionedOutputPath(outputDir)
+    sources = [os.path.join(outputDir, partialName(c)) for c in present]
+
+    # -C purges the duplicate key cycles haddfast leaves behind, so the merged
+    # file carries one cycle per histogram like a local merge does.
+    cmd = [sys.executable, haddfastPath, "-f", "-C", target] + sources
+    print("  -> %d partials -> %s" % (len(sources), target))
+    rc = subprocess.run(cmd).returncode
+    if rc != 0:
+        print("ERROR: hadd failed with code %d" % rc)
+        return False
+    print("  -> done: %s" % target)
+    return True
+
+
 # ----------------------------------------------------- Merge Years: e.g. Run 2, Run 3, ... --------------------------------------
 
 
@@ -156,6 +283,8 @@ class MergerFactory:
         outputDir=None,
         plotDir=None,
         silentMode=False,
+        cutSubset=None,
+        outputName=None,
     ):
 
 
@@ -180,10 +309,19 @@ class MergerFactory:
 
        self._cuts = list_cuts
 
-       # Run over list_cuts, not over the raw cuts dict: a cut carrying
-       # 'categories' contributes its unrolled sub-regions too. The unrolled list
-       # was built above and then never used, so until now a category sub-region
-       # was simply never merged.
+       # The loop below runs over list_cuts, not over the raw cuts dict, so a cut
+       # carrying 'categories' contributes its unrolled sub-regions too. cutSubset
+       # restricts the merge to part of that list: this is how a batch job gets its
+       # own slice, and because the slices are disjoint folders in the output the
+       # partial files can simply be hadded together afterwards.
+       if cutSubset:
+         unknown = [c for c in cutSubset if c not in list_cuts]
+         if unknown:
+           raise ValueError("unknown cut(s) %s; available: %s"
+                            % (", ".join(unknown), ", ".join(list_cuts)))
+         list_cuts = {c: list_cuts[c] for c in cutSubset}
+         print("Merging only: %s" % ", ".join(list_cuts))
+
        cuts = list_cuts
 
 
@@ -234,7 +372,11 @@ class MergerFactory:
        #
        if outputDir:
            os.makedirs(outputDir, exist_ok=True)
-       out_root_file_name = versionedOutputPath(outputDir or "")
+       if outputName:
+           out_root_file_name = (os.path.join(outputDir, outputName)
+                                 if outputDir else outputName)
+       else:
+           out_root_file_name = versionedOutputPath(outputDir or "")
        print(f"Output root file: {out_root_file_name}")
        if plotDir:
            os.makedirs(plotDir, exist_ok=True)
@@ -481,6 +623,18 @@ if __name__ == '__main__':
     parser = defaultParser()
 
     parser.add_argument("--silentMode",  action='store_true', dest="silentMode",    help="Remove as much as possible the print and the log/err files production")
+    parser.add_argument("--cut",         dest="cut",         default=None,
+                        help="Merge only these cuts, comma separated. One batch job gets one cut.")
+    parser.add_argument("--output",      dest="output",      default=None,
+                        help="Explicit output file name, relative to outputDir. Bypasses the _vN versioning.")
+    parser.add_argument("--submitBatch", action='store_true', dest="submitBatch",
+                        help="Submit one condor job per cut instead of merging locally")
+    parser.add_argument("--checkBatch",  action='store_true', dest="checkBatch",
+                        help="Report which per-cut partial files are missing")
+    parser.add_argument("--hadd",        action='store_true', dest="hadd",
+                        help="Merge the per-cut partials into root_file_joined.root")
+    parser.add_argument("--batchDir",    dest="batchDir",    default="jobsMerge",
+                        help="Where the condor scripts and logs go")
 
     opt = parser.parse_args()
     print ("opt.pycfg            = ", opt.pycfg)
@@ -539,18 +693,37 @@ if __name__ == '__main__':
     outputDir = getattr(opt, 'outputDir', None)
     plotDir   = getattr(opt, 'plotDir',   None)
 
-    factory.merge(
-       opt.tag,
-       variables,
-       cuts,
-       samples,
-       nuisances,
-       opt.foldersToMerge,
-       foldersToMergeNuisancesFiles,
-       outputDir=outputDir,
-       plotDir=plotDir,
-       silentMode=opt.silentMode,
-       )
+    cutNames = expandedCutNames(cuts)
+
+    if opt.submitBatch:
+        submitBatch(opt.pycfg, outputDir or ".", cutNames, batchDir=opt.batchDir)
+
+    elif opt.checkBatch:
+        missing, present = checkPartials(outputDir or ".", cutNames)
+        print("  -> %d/%d partials present" % (len(present), len(cutNames)))
+        for c in missing:
+            print("  MISSING: %s" % os.path.join(outputDir or ".", partialName(c)))
+        if not missing:
+            print("  -> all done, run --hadd")
+
+    elif opt.hadd:
+        haddPartials(outputDir or ".", cutNames)
+
+    else:
+        factory.merge(
+           opt.tag,
+           variables,
+           cuts,
+           samples,
+           nuisances,
+           opt.foldersToMerge,
+           foldersToMergeNuisancesFiles,
+           outputDir=outputDir,
+           plotDir=plotDir,
+           silentMode=opt.silentMode,
+           cutSubset=[c.strip() for c in opt.cut.split(",")] if opt.cut else None,
+           outputName=opt.output,
+           )
 
     print ("\n\n")
     print (" I'm done ... \n\n")
