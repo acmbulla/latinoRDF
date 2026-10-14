@@ -180,6 +180,12 @@ class MergerFactory:
 
        self._cuts = list_cuts
 
+       # Run over list_cuts, not over the raw cuts dict: a cut carrying
+       # 'categories' contributes its unrolled sub-regions too. The unrolled list
+       # was built above and then never used, so until now a category sub-region
+       # was simply never merged.
+       cuts = list_cuts
+
 
        new_list_of_nuisances = nuisances
 
