@@ -207,9 +207,15 @@ Notes:
   into `outputDir`. That name is not free: `mkPlot.py` takes it as the default
   `--inputFile`, `mkDatacards.py` hardcodes it, and `mkMergeYears.py` reads
   `<folder>/rootFile/<tag>/root_file_joined.root` for each year. Changing it
-  means changing all four. The per-job inputs are `root_file___*.root`, which
-  the glob keeps distinct from the merged file so re-running cannot fold the
-  merged output back into itself.
+  means changing all four. The per-job inputs are named
+  `root_file___<sample>_<subname>_<i>.root`, which keeps them distinct from the
+  merged file so re-running cannot fold the merged output back into itself.
+- **The merge inputs come from `samples.py`, not from the output directory.**
+  `selectOutputFiles()` matches the files on disk against the
+  `(sample, subname)` pairs the configuration declares; `checkBatch` and the
+  pre-hadd completeness check walk the declared subnames too, not
+  `os.listdir`. Anything left over is listed and skipped, never merged. See
+  "Stale per-job files" below for why this is not a convenience.
 - For snapshots the merged file is `snapshot_<tag>.root`, deliberately *not*
   matching `nanoLatino_snapshot____*.root`, since `makeFromSnapshot` globs that
   pattern per sample and would otherwise read the merged file alongside its
@@ -217,6 +223,38 @@ Notes:
 - Compilation links ROOT (`root-config --cflags/--libs`) plus
   `-lcorrectionlib`, so `correction.h`-dependent helpers compile and link
   without extra configuration.
+
+### Stale per-job files
+
+A sample's output files are keyed by the **sample name plus the dataset
+subname**, but the histograms *inside* them are keyed by the sample name alone.
+So after swapping a sample's dataset — say `WZJJ_QCD` from the madgraph
+`WZJJ_QCD` to the POWHEG `WZTo3LNu` — the directory holds
+
+```
+root_file___WZJJ_QCD_WZJJ_QCD_0.root     <- previous configuration
+root_file___WZJJ_QCD_WZTo3LNu_0.root     <- current one
+```
+
+and both contain `WZ_SR/histo_WZJJ_QCD`. A merge driven by a glob therefore
+**adds the old sample to the new one** instead of replacing it: same folder,
+same histogram name, so to `hadd` they are two chunks of one sample. No error,
+no warning. Measured on a one-bin test: 100 + 42 came out as 142.
+
+The same applies with no dataset swap at all. Commenting one
+`nanoGetSampleFiles` line out of a multi-dataset sample, or commenting out a
+whole sample, leaves every file that sample ever produced behind, and a glob
+puts them all back in. That is why the configuration is the authority.
+
+Two consequences worth knowing:
+
+- The leftover files are *reported*, not deleted. Deleting them is safe and
+  recommended, but nothing in the framework does it for you — an interrupted
+  reconfiguration should not destroy results.
+- Dropping a subname also leaves its job scripts under
+  `script_batch_location/<sample>/<subname>/`. Those are ignored as well, so a
+  deleted output file does not make `--checkBatch` or the pre-hadd check report
+  phantom missing jobs and refuse to merge.
 
 ## 5. Snapshot workflow
 
