@@ -55,6 +55,34 @@ def loadDefaultOptions(parser, pycfg=None, quiet=False):
 
 
 
+#
+# output file naming: never overwrite an existing merge
+#
+
+def versionedOutputPath(directory, base="root_file_joined.root"):
+    """
+    First merge writes <base>. Every later one is suffixed _v1, _v2, ... so an
+    existing file is never clobbered: the suffix goes on the *new* file and the
+    ones already there are left untouched.
+
+    NB mkPlot defaults --inputFile to root_file_joined.root and mkDatacards
+    hardcodes it (mkDatacards.py:909), so from the second merge on they still
+    read the first file. Pass the versioned path explicitly.
+    """
+    stem, ext = os.path.splitext(base)
+    candidate = os.path.join(directory, base) if directory else base
+    if not os.path.exists(candidate):
+        return candidate
+
+    i = 1
+    while True:
+        name = "%s_v%d%s" % (stem, i, ext)
+        candidate = os.path.join(directory, name) if directory else name
+        if not os.path.exists(candidate):
+            return candidate
+        i += 1
+
+
 # ----------------------------------------------------- Merge Years: e.g. Run 2, Run 3, ... --------------------------------------
 
 
@@ -146,17 +174,14 @@ class MergerFactory:
        #
        # get all the root files with the histograms from the different years
        #
-       _out_base = "histos_" + tag + ".root"
        if outputDir:
            os.makedirs(outputDir, exist_ok=True)
-           new_root_file_name = os.path.join(outputDir, _out_base)
-       else:
-           new_root_file_name = _out_base
-       print(f"Output root file: {new_root_file_name}")
+       out_root_file_name = versionedOutputPath(outputDir or "")
+       print(f"Output root file: {out_root_file_name}")
        if plotDir:
            os.makedirs(plotDir, exist_ok=True)
            print(f"Plot directory:   {plotDir}")
-       rootFileNew = ROOT.TFile.Open( new_root_file_name, "RECREATE")
+       rootFileNew = ROOT.TFile.Open( out_root_file_name, "RECREATE")
 
        histograms = {}
 
@@ -173,19 +198,19 @@ class MergerFactory:
          old_root_file_name = os.path.join(folder["folder"], "rootFile", folder["tag"], "root_file_joined.root")
          import tempfile
          tmp_dir = tempfile.gettempdir()
-         new_root_file_name = os.path.join(tmp_dir, "year_" + folderHR + "_histos_" + folder["tag"] + ".root")
+         local_year_file = os.path.join(tmp_dir, "year_" + folderHR + "_histos_" + folder["tag"] + ".root")
          # use xrdcp for EOS paths, plain cp otherwise
          if "/eos/" in old_root_file_name:
              import re as _re
              eos_normalized = _re.sub(r'^/eos/home-([a-z])/', lambda m: f"/eos/user/{m.group(1)}/", old_root_file_name)
-             ret = os.system(f"xrdcp -f root://eosuser.cern.ch//{eos_normalized} {new_root_file_name}")
+             ret = os.system(f"xrdcp -f root://eosuser.cern.ch//{eos_normalized} {local_year_file}")
          else:
-             ret = os.system(f"cp {old_root_file_name} {new_root_file_name}")
+             ret = os.system(f"cp {old_root_file_name} {local_year_file}")
          if ret != 0:
-             raise RuntimeError(f"Failed to copy {old_root_file_name} -> {new_root_file_name}")
-         if not os.path.exists(new_root_file_name) or os.path.getsize(new_root_file_name) == 0:
-             raise RuntimeError(f"Local copy is missing or empty: {new_root_file_name} (source: {old_root_file_name})")
-         rootFile    = ROOT.TFile.Open( new_root_file_name, "READ")
+             raise RuntimeError(f"Failed to copy {old_root_file_name} -> {local_year_file}")
+         if not os.path.exists(local_year_file) or os.path.getsize(local_year_file) == 0:
+             raise RuntimeError(f"Local copy is missing or empty: {local_year_file} (source: {old_root_file_name})")
+         rootFile    = ROOT.TFile.Open( local_year_file, "READ")
 
          rootFileNew.cd()
          histograms[folderHR] = {}
@@ -197,7 +222,7 @@ class MergerFactory:
              folder_in_file = rootFile.Get(folder_name)
 
              if not folder_in_file:
-               print(f"  WARNING: {folder_name} not found in {new_root_file_name}, skipping")
+               print(f"  WARNING: {folder_name} not found in {local_year_file}, skipping")
                continue
 
              # Pick up only the latest version of each histogram (highest key
