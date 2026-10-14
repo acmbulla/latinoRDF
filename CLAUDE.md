@@ -21,7 +21,7 @@ source setup.sh
 | `plotsConfigurationsRDF/` | **Separate git repository** (`acmbulla/plotsConfigurationsRDF`), ignored by this repo via `.gitignore:209`. Holds the per-analysis, per-year configuration files. |
 
 > **Important:** `plotsConfigurationsRDF/` is a *different repo*. Changes to
-> analysis configs (including the `gInterpreter` removal, see §6) are committed
+> analysis configs (including the `gInterpreter` removal, see §7) are committed
 > and reviewed there, **not** in a latinoRDF branch.
 
 ### Searching the tree
@@ -78,7 +78,9 @@ Options: `--localCompile`, `--submitBatch`, `--checkBatch`, `--resubmit`,
 
 ### `mkMergeYears.py`
 Merges per-year shape files into a combined multi-year result, handling
-correlated vs uncorrelated nuisances across years.
+correlated vs uncorrelated nuisances across years. Splits by cut for batch
+submission. See §6 for the workflow, the measurements behind its shape, and the
+copying limit that caps how far it can be split.
 
 ### `haddfast.py`
 Fast parallel merger for **shape/histogram** ROOT files. Used by
@@ -168,7 +170,7 @@ non-integer `era`, and an `era` outside `1..len(split)` are all rejected.
 
 Emission order before `main()` is:
 `linesToAdd` → `external` → `linesToGlobal`.
-That ordering is what makes §6 work: class definitions arrive before the global
+That ordering is what makes §7 work: class definitions arrive before the global
 instances that use them.
 
 > **Gotcha:** `_build_aliases_ordered` routes an alias into the "function"
@@ -232,7 +234,135 @@ the snapshot trees instead of nanoAOD. `SnapshotMetadata` records what exists so
 
 ---
 
-## 6. gInterpreter policy — **forbidden**
+## 6. Year merging (`mkMergeYears.py`)
+
+Sums the per-year shape files into one multi-year file. The sum is **over years
+only**: for every cut/variable folder and every sample,
+`histo_DY = histo_DY(2022) + histo_DY(2022EE) + ...`, and likewise for every
+*shape* nuisance variation. Nothing is summed across samples, regions or
+variables. `lnN` nuisances write no histogram; the one case where a `lnN` enters
+the file is a year that lacks a shape variation another year has, where its own
+nominal scaled by its `lnN` value stands in. `DATA` gets no variations.
+
+```
+mkMergeYears.py --pycfg merge_configuration.py     # everything locally
+```
+
+### Output naming
+
+The output is `root_file_joined.root`, the same name `mkShapes` produces per
+year, in `outputDir`. **An existing file is never overwritten**: the first merge
+writes the base name, every later one is suffixed `_v1`, `_v2`, … so the suffix
+lands on the *new* file. `versionedOutputPath()` owns this.
+
+> **Gotcha:** `mkPlot.py` defaults `--inputFile` to `root_file_joined.root` and
+> `mkDatacards.py` hardcodes it (`mkDatacards.py:909`). From the second merge on
+> they still read the *first* file, so pass the versioned path explicitly.
+
+### Batch splitting
+
+A folder of one cut never depends on another cut, so the work splits by cut.
+Each job writes `root_file_joined___<cut>.root`; the partials hold **disjoint**
+folders, so the hadd is a union, not an addition, and cannot double count.
+
+```
+mkMergeYears.py --submitBatch     # one condor job per cut
+mkMergeYears.py --checkBatch      # which partials are missing
+mkMergeYears.py --hadd            # union into root_file_joined.root (haddfast -C)
+```
+
+- `--cut` takes a **comma separated list, all of which run in one process** on
+  one node, sequentially, into one output file. The list makes jobs *fewer and
+  bigger*, not more parallel. `--submitBatch` queues one cut per job.
+- `--output` sets an explicit file name and bypasses the `_vN` versioning. The
+  generated job is exactly one `--cut` plus one `--output`.
+- A cut with `categories` contributes its unrolled sub-regions, so the job count
+  is the unrolled count, not `len(cuts)`.
+
+> **Do not scale this to hundreds of jobs as it stands.** Every job copies all
+> of each year's `root_file_joined.root`, whole, even though it reads one region.
+> Ten jobs over seven years is 70 copies, which is free. Splitting further —
+> region × variable would be 380 jobs and 2660 copies — makes EOS bandwidth the
+> bottleneck and the parallelism stops paying. Before going there, change the
+> reading: either stream over xrootd with no local copy, or have each job fetch
+> only the folders it needs. There is no `--variable` option today; adding one
+> is small, but it is the copying that has to be fixed first.
+
+### Why it is shaped this way — measured, not assumed
+
+Benchmarked on 7 synthetic years, 10 cuts × 8 variables × 25 samples × 2 shape
+nuisances = 9680 output histograms, and a full-scale variant with 38 variables
+and 10 nuisances = 191900 output histograms per year.
+
+| | |
+|---|---|
+| load-everything version | 352 s |
+| one folder at a time | 157 s, output identical bin by bin |
+| peak RSS | 392 MB → 401 MB, i.e. **unchanged** |
+
+The merge reads one cut/variable folder from every year, sums, writes and frees,
+rather than loading every year's whole file first. Two things to know:
+
+1. **The speed came from `SetDirectory(0)`, not from the streaming itself.** The
+   old code called `rootFileNew.cd()` and then `Clone()`d every histogram of
+   every year, so all of them were appended to one directory's in-memory object
+   list, which makes the cost quadratic. Measured on 40k clones: 4.7 s attached
+   with distinct names, **70 s attached with repeating names** — which is this
+   case, ~500 names reused in every folder of every year — against 0.17 s
+   detached.
+2. **Memory was not the win.** The peak is ROOT plus the open input files, not
+   the histograms. What streaming removes is the *growth* with the number of
+   variables and shape nuisances, which the old shape could not survive.
+
+The remaining floor is per-histogram object lifetime: creating and freeing one
+histogram read from a file costs ~0.17 ms, and an explicit `Delete()` and simply
+dropping the reference measured **the same**, so there is no trick there. The
+merge pays that once per histogram per year, which is why it splits by cut
+instead of being optimised further in Python. For reference, the useful work
+alone — `Clone` + 6 `Add` + `Write` — is 0.026 ms, and reading all of one year's
+histograms is 2.9 s.
+
+### uproot — tried, measured, deliberately not adopted
+
+| | per output histogram |
+|---|---|
+| uproot read 7 years + sum | 2.33 ms |
+| uproot write, with `sumw2` | 0.32 ms |
+| **uproot total** | **~2.65 ms** |
+| current PyROOT | ~10.2 ms |
+
+So uproot is ~3.8× faster, and `sumw2` survives correctly (written via
+`uproot.writing.identify.to_TH1x`, read back with the right errors). It was
+**not** adopted because the per-cut split already gives 10× and is verified
+identical, while uproot means rewriting `merge()` with different I/O semantics.
+The two compose, so uproot is a possible second step, not the first.
+
+If it is ever picked up:
+
+- Use `uproot.recreate()` only — write once, never update or delete in place.
+  uproot's update path is where the surprises are.
+- `fTsumwx` and `fTsumwx2` carry the mean and rms. The benchmark set them to
+  zero; real code must read them from the inputs and sum them, or `GetMean()` on
+  the merged file is wrong even though every bin is right.
+- Decide what happens to objects that are not `TH1`. uproot will not pass them
+  through on its own.
+
+### Duplicate key cycles
+
+`haddfast.py` merges by calling `TH1::Write()` without `kOverwrite`, so a
+histogram that is *added* to an existing one gains a key cycle instead of
+replacing it: `;1` holds the first chunk alone and the highest cycle the running
+sum. `TFile::Get()` resolves a bare name to the highest cycle, so `mkPlot` and
+`mkDatacards` were always fine, but **`GetListOfKeys()` returns every cycle, in
+descending order**. Code that keys a dict by name and lets the last iteration
+win therefore keeps the *partial* histogram. That was a real bug in this script
+and it under-counted every sample. Both ends are fixed: `mkShapes.py --haddBatch`
+passes `-C` so new files carry one cycle, and `readFolder()` dedups on the
+highest cycle like `haddfast.merge()` already did.
+
+---
+
+## 7. gInterpreter policy — **forbidden**
 
 Runtime JIT declaration has been **rejected by reviewers** and must not be
 reintroduced.
@@ -381,7 +511,7 @@ errors to runtime, and hides the source from the compiler.
   `'expr': '1.'` existed only to host the one-off `Declare`. They are no longer
   needed and should be deleted.
 
-## 7. Commit conventions
+## 8. Commit conventions
 
 Conventional-commit prefixes, imperative mood, lower-case subject:
 
