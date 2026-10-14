@@ -424,7 +424,7 @@ int main() {{
         super().haddBatch(
             tag          = tag,
             output_dir   = self._folder_where_to_save_trees,
-            glob_pattern = "nanoLatino_snapshot____*.root",
+            name_prefix  = "nanoLatino_snapshot____",
             output_name  = f"snapshot_{tag}.root",
             hadd_tool_path = haddnano_path,
             hadd_tool_args = "",   # haddnano doesn't need extra args

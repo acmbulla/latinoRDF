@@ -211,6 +211,65 @@ class AnalysisFactory:
         return result
 
     # _____________________________________________________________________________
+    #  What the configuration asks for, as opposed to what is on disk
+    # _____________________________________________________________________________
+
+    def declaredSubnames(self):
+        """
+        The (sampleName, subname) pairs declared in samples.py.
+
+        The authority on what belongs in a merge is the configuration, not the
+        output directory. Commenting one `nanoGetSampleFiles` line drops that
+        subname, commenting a whole block drops the sample key, and swapping a
+        sample's dataset changes the subname -- in every case the files the
+        previous configuration left behind must be ignored.
+        """
+        pairs = []
+        for sampleName, sample in self._samples.items():
+            for subname in self._normalize_sample_name(sample['name']):
+                pairs.append((sampleName, subname))
+        return pairs
+
+    def selectOutputFiles(self, output_dir, name_prefix):
+        """
+        Split the per-job output files in output_dir into the ones samples.py
+        asks for and the ones left over from an earlier configuration.
+        Returns (wanted, orphans), both sorted lists of paths.
+
+        Why this cannot be a glob per sample: a file is
+        `<name_prefix><sample>_<subname>_<i>.root` with nothing delimiting the
+        three fields, so with subnames `MLL-50` and `MLL-50_ext1` a glob for
+        the first also swallows the second. Matching the declared pairs and
+        requiring the remainder to be the integer job index does not.
+        """
+        import glob as _glob
+
+        pairs   = self.declaredSubnames()
+        found   = sorted(_glob.glob(os.path.join(output_dir, name_prefix + "*.root")))
+        wanted  = []
+        orphans = []
+        for path in found:
+            stem = os.path.basename(path)[len(name_prefix):-len(".root")]
+            for sampleName, subname in pairs:
+                head = f"{sampleName}_{subname}_"
+                if stem.startswith(head) and stem[len(head):].isdigit():
+                    wanted.append(path)
+                    break
+            else:
+                orphans.append(path)
+        return wanted, orphans
+
+    @staticmethod
+    def reportOrphans(orphans, action="ignoring"):
+        """Name the files the configuration does not ask for. Silence here is
+        what made a stale sample merge into the result unnoticed."""
+        if not orphans:
+            return
+        print(f"  -> {action} {len(orphans)} file(s) not declared in samples.py:")
+        for f in orphans:
+            print(f"       {os.path.basename(f)}")
+
+    # _____________________________________________________________________________
     #  Event counting + cache
     # _____________________________________________________________________________
 
@@ -844,13 +903,16 @@ class AnalysisFactory:
         stats      = {}
         missing_sh = []
 
-        for sampleName in self._samples:
+        for sampleName, sample in self._samples.items():
             sample_batch_dir = os.path.join(self._script_batch_location, sampleName)
             if not os.path.isdir(sample_batch_dir):
                 continue
             stats[sampleName] = {'done': 0, 'error': 0, 'missing': 0}
 
-            for subname in os.listdir(sample_batch_dir):
+            # the declared subnames, not os.listdir: a subname dropped from
+            # samples.py keeps its old job scripts, and counting those would
+            # report work that is no longer wanted as missing
+            for subname in self._normalize_sample_name(sample['name']):
                 subname_dir = os.path.join(sample_batch_dir, subname)
                 if not os.path.isdir(subname_dir):
                     continue
@@ -995,11 +1057,11 @@ class AnalysisFactory:
         Does not print a table — just counts missing files.
         """
         missing = []
-        for sampleName in self._samples:
+        for sampleName, sample in self._samples.items():
             sample_batch_dir = os.path.join(self._script_batch_location, sampleName)
             if not os.path.isdir(sample_batch_dir):
                 continue
-            for subname in os.listdir(sample_batch_dir):
+            for subname in self._normalize_sample_name(sample['name']):
                 subname_dir = os.path.join(sample_batch_dir, subname)
                 if not os.path.isdir(subname_dir):
                     continue
@@ -1013,14 +1075,15 @@ class AnalysisFactory:
                         missing.append(root_file)
         return len(missing) == 0, missing
 
-    def haddBatch(self, tag, output_dir, glob_pattern, output_name,
+    def haddBatch(self, tag, output_dir, name_prefix, output_name,
                   hadd_tool_path, hadd_tool_args="-f -j 8 -E"):
         """
-        Submit a single condor job that hadd all files matching glob_pattern in output_dir.
+        Submit a single condor job that merges the per-job output files in
+        output_dir which samples.py declares.
+        name_prefix: the common prefix of the per-job file names
         hadd_tool_path: path to haddfast.py or haddnano.py
         hadd_tool_args: extra args to pass to the tool
         """
-        import glob as _glob
         import re as _re
 
         submission_dir = os.getcwd()
@@ -1046,10 +1109,14 @@ class AnalysisFactory:
         output_dir_normalized = _re.sub(r'^/eos/home-([a-z])/',
                                          lambda m: f"/eos/user/{m.group(1)}/", output_dir)
 
-        # find all files matching pattern
-        all_files = sorted(_glob.glob(os.path.join(output_dir, glob_pattern)))
+        # driven by samples.py, never by whatever is in output_dir. Files from
+        # a previous configuration carry the same histogram folder and
+        # histogram names, so a merge would *sum* them into the result rather
+        # than replace them, and the double counting is silent.
+        all_files, orphans = self.selectOutputFiles(output_dir, name_prefix)
+        self.reportOrphans(orphans)
         if not all_files:
-            print(f"ERROR: no files found matching {os.path.join(output_dir, glob_pattern)}")
+            print(f"ERROR: no file in {output_dir} belongs to a sample declared in samples.py")
             return
         print(f"  -> Found {len(all_files)} files to hadd")
 
