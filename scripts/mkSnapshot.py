@@ -259,7 +259,13 @@ int main() {{
 
     def generate_makefile(self, file_paths, makefile_name="MakefileSnapshot"):
         cpp_flags = "$(shell root-config --cflags)"
-        ld_flags  = "$(shell root-config --libs) -lTMVA -lXMLIO"
+        # Same link line the batch scripts use. correctionlib is not optional:
+        # evaluate_btagSF{bc,light}.cc call correction::CorrectionSet, so every
+        # configuration with a b-tag scale factor fails at link time without it.
+        ld_flags  = ("$(shell root-config --libs) -lTMVA -lXMLIO "
+                     "-I/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/include "
+                     "-L/cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/lib "
+                     "-lcorrectionlib")
         targets   = [os.path.splitext(f)[0] for f in file_paths]
         with open(makefile_name, "w") as f:
             f.write("# Generated MakefileSnapshot\nCXX = g++\n")
