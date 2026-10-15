@@ -18,7 +18,7 @@ source setup.sh
 |---|---|
 | `scripts/` | The executable framework: `mkShapes.py`, `mkSnapshot.py`, `analysisFactory.py`, `mkPlot.py`, `mkDatacards.py`, `mkMergeYears.py`, `haddfast.py`, `haddnano.py`, `easyDescription.py` |
 | `lib/` | Plot styling helpers (`tdrStyle.py`, `CMS_lumi.py`) and `search_files.py` |
-| `plotsConfigurationsRDF/` | **Separate git repository** (`acmbulla/plotsConfigurationsRDF`), ignored by this repo via `.gitignore:209`. Holds the per-analysis, per-year configuration files. |
+| `plotsConfigurationsRDF/` | **Separate git repository** (`acmbulla/plotsConfigurationsRDF`), checked out as a *sibling* of this one (`<parent>/latinoRDF` and `<parent>/plotsConfigurationsRDF`). Holds the per-analysis, per-year configuration files. |
 
 > **Important:** `plotsConfigurationsRDF/` is a *different repo*. Changes to
 > analysis configs (including the `gInterpreter` removal, see §7) are committed
@@ -26,11 +26,11 @@ source setup.sh
 
 ### Searching the tree
 
-The configured shell wraps `grep` with `--ignore-files`, which honours
-`.gitignore`. Because `plotsConfigurationsRDF/` is gitignored, a plain
-`grep -r <pattern> .` from the repo root **silently finds nothing there**.
-Use `command grep -r ...` (or `git grep` inside the nested repo) when searching
-configuration files.
+The configurations are not under this tree, so `grep -r <pattern> .` from the
+repo root never finds them. Search `../plotsConfigurationsRDF` explicitly, or
+`git grep` from inside that repo. If you instead keep the checkout *inside*
+latinoRDF, remember it is untracked here and will be picked up by a careless
+`git add -A`.
 
 ---
 
@@ -61,20 +61,18 @@ Subclasses must implement `job_prefix()`, `output_file_name()`, `makeScripts()`,
 
 ### `mkShapes.py` — histogram production (`ShapeFactory`)
 Generates and runs the C++ that fills histograms for every
-sample × cut × variable × nuisance. Reads nanoAOD directly, or existing
-snapshots via `makeFromSnapshot()` (`--fromSnapshot`).
+sample × cut × variable × nuisance. Reads nanoAOD directly.
 
-Options: `--parallelCompile`, `--localCompile`, `--fromSnapshot`,
+Options: `--parallelCompile`, `--localCompile`,
 `--submitBatch`, `--hadd`, `--haddBatch`, `--checkBatch`, `--resubmit`,
 `--silentMode`.
 
 ### `mkSnapshot.py` — skimmed-tree production (`SnapshotFactory`)
 Writes reduced nanoAOD-style trees (snapshots) so later shape production can
-skip the expensive full-nanoAOD pass. Tracks what was produced via
-`SnapshotMetadata`, and supports `--patch` to top up an incomplete snapshot set.
+skip the expensive full-nanoAOD pass.
 
 Options: `--localCompile`, `--submitBatch`, `--checkBatch`, `--resubmit`,
-`--silentMode`, `--haddBatch`, `--patch`, `--shapeNuisances`, `--force`.
+`--silentMode`, `--haddBatch`, `--shapeNuisances`.
 
 ### `mkMergeYears.py`
 Merges per-year shape files into a combined multi-year result, handling
@@ -217,9 +215,8 @@ Notes:
   `os.listdir`. Anything left over is listed and skipped, never merged. See
   "Stale per-job files" below for why this is not a convenience.
 - For snapshots the merged file is `snapshot_<tag>.root`, deliberately *not*
-  matching `nanoLatino_snapshot____*.root`, since `makeFromSnapshot` globs that
-  pattern per sample and would otherwise read the merged file alongside its
-  own parts.
+  matching the per-job pattern `nanoLatino_snapshot____*.root`, so anything
+  globbing the parts cannot pick up the merged file alongside them.
 - Compilation links ROOT (`root-config --cflags/--libs`) plus
   `-lcorrectionlib`, so `correction.h`-dependent helpers compile and link
   without extra configuration.
@@ -262,13 +259,11 @@ Two consequences worth knowing:
 mkSnapshot.py --submitBatch           # produce skimmed trees
 mkSnapshot.py --checkBatch [--resubmit]
 mkSnapshot.py --haddBatch             # merge with haddnano.py
-mkSnapshot.py --patch                 # top up an incomplete snapshot set
-mkShapes.py --fromSnapshot --submitBatch   # fill histograms from snapshots
 ```
 
-`mkShapes.py --fromSnapshot` routes through `makeFromSnapshot()`, which reads
-the snapshot trees instead of nanoAOD. `SnapshotMetadata` records what exists so
-`--patch` can regenerate only what is missing.
+`--shapeNuisances` generates the varied trees
+(`nanoLatino_snapshot____<sample>_<subname>_<i>_<nuisance>Up/Down.root`)
+alongside the nominal ones.
 
 ---
 
@@ -285,6 +280,29 @@ nominal scaled by its `lnN` value stands in. `DATA` gets no variations.
 ```
 mkMergeYears.py --pycfg merge_configuration.py     # everything locally
 ```
+
+### `foldersToMerge` — one entry per year
+
+```python
+foldersToMerge = {
+  "2022" : {
+    "folder" : "../2022",             # the year's analysis directory
+    "tag"    : "261012_22",           # its tag, i.e. rootFile/<tag>/
+  },
+  "2024" : {
+    "folder" : "../2024",
+    "tag"    : "261012_24",
+    # optional: the same physical process is named differently in this year.
+    # Maps old -> new, and renames histo_<old> plus every one of its nuisance
+    # variations (histo_<old>_<nuis>up/down) before the sum.
+    "sampleRename" : {"WZJJ_QCD_v2": "WZJJ_QCD", "DY_2024": "DY"},
+  },
+}
+```
+
+Each year is read from `<folder>/rootFile/<tag>/root_file_joined.root`, copied
+locally first (`xrdcp` for EOS paths, `cp` otherwise). `outputDir` and
+`plotDir` from the merge configuration say where the result goes.
 
 ### Output naming
 
