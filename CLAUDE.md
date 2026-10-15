@@ -200,8 +200,17 @@ Notes:
   shipped to the node) and **compile-on-node**.
 - EOS copies use `xrdcp -f`; the job creates its output directory with
   `mkdir -p` before the executable runs.
-- A valid X509 proxy is required; `submitBatch` checks it and aborts early if
-  missing.
+- **The X509 proxy is optional.** `submitBatch` looks for one
+  (`$X509_USER_PROXY`, `~/.proxy`, `/tmp/x509up_u<uid>`), ships it with the job
+  and warns if there is none, but never aborts: CERN EOS over
+  `root://eosuser.cern.ch` / `root://eoscms.cern.ch` authenticates with
+  Kerberos too, so a user with EOS access and no grid certificate can submit.
+  A proxy *is* needed to read inputs through a CMS redirector
+  (`root://xrootd-cms...`, `cms-xrd-global`), which only accepts GSI — without
+  one those jobs fail on the node with an xrootd authentication error. Relying
+  on Kerberos also means the job needs the credential forwarded
+  (`MY.SendCredential = True` in the submit file, with a credential stored on
+  the schedd); that is not set by default.
 - `--haddBatch` uses `haddfast.py` for shapes and `haddnano.py` for snapshots.
 - For shapes, both `--hadd` and `--haddBatch` write `root_file_joined.root`
   into `outputDir`. That name is not free: `mkPlot.py` takes it as the default
