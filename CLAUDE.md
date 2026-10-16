@@ -196,13 +196,21 @@ Notes:
   `condor_submit` with `cwd=script_batch_location`.
 - Batch script names are derived from the generated `.cpp` filename (not the
   legacy generic `my_script_*`), so jobs are identifiable in the queue.
-- The two compilation modes are chosen **per job**: a job whose binary is
-  already built ships the binary, one whose is not ships its `.cpp` and
-  compiles on the node. So nothing has to be compiled before submitting, and a
-  partially built set is fine. `submitBatch` prints the tally and aborts only
-  when a job has neither a binary nor a `.cpp`, which means its scripts were
-  never generated. `transfer_input_files` is one line for the whole cluster, so
-  when any job compiles on the node the list carries what that needs.
+- **The generation step is not a separate invocation.** `--submitBatch`,
+  `--localCompile` and `--parallelCompile` all run it first, so
+  `mkShapes.py --submitBatch` on an empty job directory works. Only
+  `--checkBatch` and the hadd steps skip it, because they read what is already
+  on disk. The `.cpp` are written through `_write_if_changed`, so regenerating
+  is cheap and leaves an unchanged file's mtime alone.
+- The two compilation modes are chosen **per job**: a job ships its binary if
+  that binary exists *and is newer than its `.cpp`*, otherwise it ships the
+  `.cpp` and compiles on the node (a minute or two). So nothing has to be
+  compiled before submitting, a partially built set is fine, and a binary left
+  over from an older configuration is recompiled instead of being shipped
+  silently. `submitBatch` prints the tally and aborts only when a job has
+  neither, which means its scripts were never generated.
+  `transfer_input_files` is one line for the whole cluster, so when any job
+  compiles on the node the list carries what that needs.
 - EOS copies use `xrdcp -f`; the job creates its output directory with
   `mkdir -p` before the executable runs.
 - **The X509 proxy is optional.** `submitBatch` looks for one

@@ -731,6 +731,27 @@ class AnalysisFactory:
         return f"cp {src} {dest_dir}/"
 
     @staticmethod
+    def _write_if_changed(path, content):
+        """Write content to path only when it differs from what is there.
+
+        The generation step runs again before every compile and every submit,
+        so without this every .cpp would get a fresh mtime each time and the
+        binary next to it would always look stale. submitBatch compares the two
+        mtimes to decide whether to ship the binary or recompile on the node,
+        and that comparison is only meaningful if an unchanged file is left
+        alone.
+        """
+        try:
+            with open(path, 'r') as fh:
+                if fh.read() == content:
+                    return False
+        except OSError:
+            pass
+        with open(path, 'w') as fh:
+            fh.write(content)
+        return True
+
+    @staticmethod
     def _clean_transfer_list(files_str):
         """Drop the empty entries of a comma-separated transfer_input_files list.
 
@@ -836,7 +857,15 @@ class AnalysisFactory:
                     # the cluster over a binary that was never built. Shipping
                     # the .cpp of whatever is not compiled yet is always safe:
                     # the node compiles it in a minute or two.
-                    if os.path.isfile(abs_executable):
+                    # A binary older than its .cpp was built from a source
+                    # the generation step has since rewritten, i.e. from an
+                    # older configuration. Recompiling on the node costs a
+                    # minute; shipping it silently produces wrong histograms.
+                    usable_exe = (os.path.isfile(abs_executable)
+                                  and (not os.path.isfile(abs_cpp)
+                                       or os.path.getmtime(abs_executable)
+                                          >= os.path.getmtime(abs_cpp)))
+                    if usable_exe:
                         bash_code = self._build_bash_precompiled(
                             job_name, out_file, sampleName, subname, proxy_lines,
                             submission_dir, root_cflags, root_libs)

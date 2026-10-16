@@ -404,8 +404,7 @@ int main() {{
     return 0;
 }}
 """
-        with open(f"{output_name}.cpp", "w") as f:
-            f.write(cpp_code)
+        self._write_if_changed(f"{output_name}.cpp", cpp_code)
 
     # _____________________________________________________________________________
     #  generate_makefile (standalone — no liblibrary_utils)
