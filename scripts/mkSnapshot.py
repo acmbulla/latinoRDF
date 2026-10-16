@@ -139,12 +139,27 @@ class SnapshotFactory(AnalysisFactory):
         self._scripts_run_folder         = 'scripts_snapshot_run'
         self._script_batch_location      = './scripts_snapshot_batch/'
         self._metadata                   = None
-        self._shapeNuisances             = False
+        self._skipShapeNuisances         = False
 
     # _____________________________________________________________________________
-    def setShapeNuisances(self, enabled):
-        """Whether submitBatch also queues the shape-nuisance jobs."""
-        self._shapeNuisances = bool(enabled)
+    def setSkipShapeNuisances(self, skip):
+        """Opt out of the shape-nuisance jobs even though nuisances.py declares them."""
+        self._skipShapeNuisances = bool(skip)
+
+    # _____________________________________________________________________________
+    def doShapeNuisances(self):
+        """Whether the varied trees are part of this run.
+
+        Derived from the configuration, not from a command-line flag: a
+        'suffix' nuisance left uncommented in nuisances.py IS the request. The
+        flag only existed because submitBatch could not see those jobs, and
+        having to repeat it on every step was a way to generate the varied
+        .cpp and then submit only the nominal ones -- a silent half-run.
+
+        setSkipShapeNuisances() is the escape hatch, for a quick nominal-only
+        snapshot without editing nuisances.py.
+        """
+        return bool(self._suffixNuisances()) and not self._skipShapeNuisances
 
     # _____________________________________________________________________________
     def _suffixNuisances(self):
@@ -168,7 +183,7 @@ class SnapshotFactory(AnalysisFactory):
     # _____________________________________________________________________________
     def _batch_jobs_for_chunk(self, sampleName, subname, i):
         jobs = super()._batch_jobs_for_chunk(sampleName, subname, i)
-        if not self._shapeNuisances:
+        if not self.doShapeNuisances():
             return jobs
         for nuisanceName, nuisance in self._suffixNuisances():
             if sampleName not in nuisance.get('samples', {}):
@@ -523,6 +538,12 @@ int main() {{
         print(f"  -> Metadata saved: {self._metadata._path}")
 
         self.generate_makefile(list_of_files_to_compile)
+
+        # The varied trees belong to the same run, so generate them here rather
+        # than behind a flag -- otherwise submitBatch queues jobs whose .cpp
+        # does not exist.
+        if self.doShapeNuisances() and not patch_mode:
+            self.makeShapeNuisances()
         subprocess.run(["make", "-f", "MakefileSnapshot", "clean"])
         print("Scripts generated. To compile: make -f MakefileSnapshot -j8")
         print("Or use --localCompile.")
@@ -723,7 +744,12 @@ if __name__ == '__main__':
     parser.add_argument("--patch",           action='store_true', dest="patch",
                         help="Add missing variables to existing snapshots")
     parser.add_argument("--shapeNuisances",  action='store_true', dest="shapeNuisances",
-                        help="Generate alternative TTree files for shape nuisances")
+                        help="No longer needed: the varied trees are produced "
+                             "whenever nuisances.py declares a 'suffix' nuisance. "
+                             "Accepted and ignored.")
+    parser.add_argument("--noShapeNuisances", action='store_true', dest="noShapeNuisances",
+                        help="Nominal snapshot only, ignoring the 'suffix' "
+                             "nuisances declared in nuisances.py")
     parser.add_argument("--force",           action='store_true', dest="force",
                         help="Force regeneration even if already done")
 
@@ -764,21 +790,32 @@ if __name__ == '__main__':
     factory.setSnapshotValues(variables_to_dump, cut_to_dump, folder_where_to_save_trees)
     factory.setConditions(opt.silentMode)
 
+    factory.setSkipShapeNuisances(opt.noShapeNuisances)
+    if opt.shapeNuisances:
+        print("  NOTE: --shapeNuisances is no longer needed; the varied trees are\n"
+              "        produced whenever nuisances.py declares a 'suffix' nuisance.\n"
+              "        Use --noShapeNuisances to opt out.")
+
+    n_suffix = len(factory._suffixNuisances())
+    if n_suffix:
+        if factory.doShapeNuisances():
+            print(f"  -> {n_suffix} shape nuisance(s): {2 * n_suffix} varied tree(s) per job.")
+        else:
+            print(f"  -> {n_suffix} shape nuisance(s) declared, skipped (--noShapeNuisances).")
+
     if not any([opt.submitBatch, opt.checkBatch, opt.localCompile,
-                opt.patch, opt.shapeNuisances, opt.haddBatch]):
+                opt.patch, opt.haddBatch]):
         factory.makeScripts(force=opt.force)
 
     if opt.patch:
         factory.makeScripts(patch_mode=True, force=opt.force)
 
-    factory.setShapeNuisances(opt.shapeNuisances)
-
-    if opt.shapeNuisances:
-        factory.makeShapeNuisances()
-
     if opt.localCompile:
         factory.makeScripts(force=opt.force)
         subprocess.run(["make", "-f", "MakefileSnapshot", "-j8"])
+        # makeScripts wrote this one too, so build it in the same breath
+        if factory.doShapeNuisances():
+            subprocess.run(["make", "-f", "MakefileSnapshotNuisances", "-j8"])
 
     if opt.submitBatch:
         factory.submitBatch()

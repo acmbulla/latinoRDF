@@ -286,17 +286,28 @@ the snapshot trees instead of nanoAOD. `SnapshotMetadata` records what exists so
 
 ### Shape nuisances in a snapshot
 
+**There is no flag.** A `suffix` nuisance left uncommented in `nuisances.py` *is*
+the request, so the varied trees are part of every step by themselves:
+
 ```
-mkSnapshot.py --shapeNuisances                     # generate the varied .cpp
-make -f MakefileSnapshot          -j8              # nominal binaries
-make -f MakefileSnapshotNuisances -j8              # varied binaries
-mkSnapshot.py --shapeNuisances --submitBatch       # queue nominal + varied
-mkSnapshot.py --shapeNuisances --checkBatch [--resubmit]
+mkSnapshot.py --localCompile          # generates and builds nominal + varied
+mkSnapshot.py --submitBatch           # queues nominal + varied
+mkSnapshot.py --checkBatch [--resubmit]
+mkSnapshot.py --haddBatch             # nominal only, by design (see below)
+mkSnapshot.py --noShapeNuisances ...  # escape hatch: nominal only
 ```
 
-`--shapeNuisances` has to be passed to **every** step, `--submitBatch` and
-`--checkBatch` included: it is what puts the varied jobs in the list, and
-without it those steps see only the nominal ones.
+`--shapeNuisances` is still accepted and ignored, with a note. It used to be
+required on every step, which made it possible to generate the varied `.cpp`
+and then submit only the nominal jobs — a half-run with nothing to say so.
+`makeScripts()` now writes both makefiles, `--localCompile` builds both, and
+`SnapshotFactory.doShapeNuisances()` is the single predicate.
+
+Nothing has to be compiled before submitting. The choice between shipping a
+binary and shipping the `.cpp` is made **per job**: whatever is already built
+goes as a binary, the rest compiles on the node. `submitBatch` prints the
+tally. It aborts only when a job has neither, which means the scripts were
+never generated.
 
 Only the `suffix` / `suffixFly` nuisances need any of this — they read a varied
 copy of the nanoAOD, so they need their own pass. The `weight` ones do not:
