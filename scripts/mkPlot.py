@@ -80,7 +80,8 @@ class PlotFactory:
     # _____________________________________________________________________________
     def __init__(self):
 
-        self._plotsToWrite = ['c', 'cratio', 'cdifference']
+        # self._plotsToWrite = ['c', 'cratio', 'cdifference']
+        self._plotsToWrite = ['cratio']
         self._FigNamePF = ''
         self._fileFormats = ['png', 'root']
 
