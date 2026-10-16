@@ -139,6 +139,44 @@ class SnapshotFactory(AnalysisFactory):
         self._scripts_run_folder         = 'scripts_snapshot_run'
         self._script_batch_location      = './scripts_snapshot_batch/'
         self._metadata                   = None
+        self._shapeNuisances             = False
+
+    # _____________________________________________________________________________
+    def setShapeNuisances(self, enabled):
+        """Whether submitBatch also queues the shape-nuisance jobs."""
+        self._shapeNuisances = bool(enabled)
+
+    # _____________________________________________________________________________
+    def _suffixNuisances(self):
+        """The shape nuisances that need a separate pass over a varied tree."""
+        return [(n, nu) for n, nu in self._nuisances.items()
+                if nu.get('type') == 'shape'
+                and nu.get('kind') in ('suffix', 'suffixFly')]
+
+    def _nuisance_names(self, nuisanceName, direction, sampleName, subname, i):
+        """(job_name, out_file) of one varied job -- the ONLY place they are spelled.
+
+        makeShapeNuisances, _batch_jobs_for_chunk and _output_file_from_suffix
+        all go through this, because the job name and the output name order
+        their fields differently (nuisance first in one, last in the other) and
+        hand-writing that twice is how checkBatch came to look for a file no
+        job ever wrote.
+        """
+        return (f"{self.job_prefix()}_{nuisanceName}{direction}_{sampleName}_{subname}_{i}",
+                f"nanoLatino_snapshot____{sampleName}_{subname}_{i}_{nuisanceName}{direction}.root")
+
+    # _____________________________________________________________________________
+    def _batch_jobs_for_chunk(self, sampleName, subname, i):
+        jobs = super()._batch_jobs_for_chunk(sampleName, subname, i)
+        if not self._shapeNuisances:
+            return jobs
+        for nuisanceName, nuisance in self._suffixNuisances():
+            if sampleName not in nuisance.get('samples', {}):
+                continue
+            for direction in ('Up', 'Down'):
+                jobs.append(self._nuisance_names(nuisanceName, direction,
+                                                 sampleName, subname, i))
+        return jobs
 
     # _____________________________________________________________________________
     def setSnapshotValues(self, variables_to_dump, cut_to_dump, folder_where_to_save_trees):
@@ -157,6 +195,22 @@ class SnapshotFactory(AnalysisFactory):
         return f"nanoLatino_snapshot____{sampleName}_{subname}_{i}.root"
 
     def _output_file_from_suffix(self, sampleName, subname, suffix):
+        """The output file of the job whose name is job_prefix() + '_' + suffix.
+
+        checkBatch strips job_prefix() and hands us the rest, so for a nominal
+        job the suffix IS the output stem. For a varied one it is not: the job
+        name starts with <nuisance><Up|Down>_ while the file ends with it, so
+        the field has to be moved back. Without this every shape-nuisance job
+        was reported missing even after it had run.
+        """
+        for nuisanceName, _ in self._suffixNuisances():
+            for direction in ('Up', 'Down'):
+                head = f"{nuisanceName}{direction}_"
+                if suffix.startswith(head):
+                    stem = suffix[len(head):]
+                    return os.path.join(
+                        self._folder_where_to_save_trees,
+                        f"nanoLatino_snapshot____{stem}_{nuisanceName}{direction}.root")
         return os.path.join(self._folder_where_to_save_trees,
                             f"nanoLatino_snapshot____{suffix}.root")
 
@@ -529,10 +583,8 @@ int main() {{
                                 fname = os.path.basename(f_path)
                                 alt_files.append(os.path.join(folder, fname))
 
-                            job_name  = (f"my_snapshot_{nuisanceName}{direction}_"
-                                         f"{sampleName}_{subname}_{i}")
-                            out_file  = (f"nanoLatino_snapshot____{sampleName}_{subname}_{i}"
-                                         f"_{nuisanceName}{direction}.root")
+                            job_name, out_file = self._nuisance_names(
+                                nuisanceName, direction, sampleName, subname, i)
                             name_code = os.path.join(self._scripts_run_folder, sampleName,
                                                      subname, job_name)
 
@@ -636,8 +688,7 @@ echo "Done at $(date)"; ls -lh
                 for sh_file in sh_files:
                     job_name = sh_file[:-3]
                     suffix   = job_name.replace(self.job_prefix() + "_", "", 1)
-                    out_path = os.path.join(self._folder_where_to_save_trees,
-                                            f"nanoLatino_snapshot____{suffix}.root")
+                    out_path = self._output_file_from_suffix(sampleName, subname, suffix)
                     job_key  = suffix
                     if os.path.exists(out_path):
                         self._metadata.mark_completed(job_key, out_path)
@@ -719,6 +770,8 @@ if __name__ == '__main__':
 
     if opt.patch:
         factory.makeScripts(patch_mode=True, force=opt.force)
+
+    factory.setShapeNuisances(opt.shapeNuisances)
 
     if opt.shapeNuisances:
         factory.makeShapeNuisances()

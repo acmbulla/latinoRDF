@@ -279,6 +279,40 @@ mkShapes.py --fromSnapshot --submitBatch   # fill histograms from snapshots
 the snapshot trees instead of nanoAOD. `SnapshotMetadata` records what exists so
 `--patch` can regenerate only what is missing.
 
+### Shape nuisances in a snapshot
+
+```
+mkSnapshot.py --shapeNuisances                     # generate the varied .cpp
+make -f MakefileSnapshot          -j8              # nominal binaries
+make -f MakefileSnapshotNuisances -j8              # varied binaries
+mkSnapshot.py --shapeNuisances --submitBatch       # queue nominal + varied
+mkSnapshot.py --shapeNuisances --checkBatch [--resubmit]
+```
+
+`--shapeNuisances` has to be passed to **every** step, `--submitBatch` and
+`--checkBatch` included: it is what puts the varied jobs in the list, and
+without it those steps see only the nominal ones.
+
+Only the `suffix` / `suffixFly` nuisances need any of this — they read a varied
+copy of the nanoAOD, so they need their own pass. The `weight` ones do not:
+`_build_full_variables_to_dump` already adds a `my_sample_weight_<name>Up` and
+`Down` branch for each of them, so the varied weight is in the nominal tree. At
+148 nuisances that is 258 extra branches, 206 of them PDF, and it dominates the
+file size.
+
+Naming, and why it is in one place. A varied job is
+`my_snapshot_<nuisance><Up|Down>_<sample>_<subname>_<i>` and writes
+`nanoLatino_snapshot____<sample>_<subname>_<i>_<nuisance><Up|Down>.root` — the
+nuisance leads in the job name and trails in the file name. `checkBatch` finds
+jobs by listing the `.sh` on disk and strips `job_prefix()_`, so it has to undo
+that reordering; `SnapshotFactory._nuisance_names()` and
+`_output_file_from_suffix()` are the only two places that know the layout.
+
+The varied files are deliberately *not* merged by `--haddBatch`:
+`selectOutputFiles` requires what follows `<sample>_<subname>_` to be the
+integer job index alone, so `..._0_JERUp.root` is reported as an orphan and
+skipped. They are inputs for `--fromSnapshot`, not chunks of the nominal tree.
+
 ---
 
 ## 6. Year merging (`mkMergeYears.py`)
