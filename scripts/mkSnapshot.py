@@ -802,15 +802,17 @@ if __name__ == '__main__':
         else:
             print(f"  -> {n_suffix} shape nuisance(s) declared, skipped (--noShapeNuisances).")
 
-    if not any([opt.submitBatch, opt.checkBatch, opt.localCompile,
-                opt.patch, opt.haddBatch]):
-        factory.makeScripts(force=opt.force)
-
+    # Generating the scripts is the prerequisite of compiling and of submitting,
+    # and it is cheap and idempotent (_write_if_changed), so it runs for those
+    # too. It used to be a separate bare invocation, so --submitBatch on a clean
+    # job directory queued jobs whose .cpp did not exist.
+    # --checkBatch and --haddBatch only read what is already there.
     if opt.patch:
         factory.makeScripts(patch_mode=True, force=opt.force)
+    elif not any([opt.checkBatch, opt.haddBatch]):
+        factory.makeScripts(force=opt.force)
 
     if opt.localCompile:
-        factory.makeScripts(force=opt.force)
         subprocess.run(["make", "-f", "MakefileSnapshot", "-j8"])
         # makeScripts wrote this one too, so build it in the same breath
         if factory.doShapeNuisances():

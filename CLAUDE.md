@@ -298,24 +298,23 @@ the snapshot trees instead of nanoAOD. `SnapshotMetadata` records what exists so
 the request, so the varied trees are part of every step by themselves:
 
 ```
-mkSnapshot.py --localCompile          # generates and builds nominal + varied
-mkSnapshot.py --submitBatch           # queues nominal + varied
+mkSnapshot.py --submitBatch           # generates, then queues nominal + varied
 mkSnapshot.py --checkBatch [--resubmit]
 mkSnapshot.py --haddBatch             # nominal only, by design (see below)
+
+mkSnapshot.py --localCompile          # optional: build locally first
 mkSnapshot.py --noShapeNuisances ...  # escape hatch: nominal only
 ```
+
+`--submitBatch` is enough on its own: it generates the `.cpp` (nominal and
+varied), finds no binaries and ships the sources, and the nodes compile.
+`--localCompile` only trades node time for local time.
 
 `--shapeNuisances` is still accepted and ignored, with a note. It used to be
 required on every step, which made it possible to generate the varied `.cpp`
 and then submit only the nominal jobs — a half-run with nothing to say so.
 `makeScripts()` now writes both makefiles, `--localCompile` builds both, and
 `SnapshotFactory.doShapeNuisances()` is the single predicate.
-
-Nothing has to be compiled before submitting. The choice between shipping a
-binary and shipping the `.cpp` is made **per job**: whatever is already built
-goes as a binary, the rest compiles on the node. `submitBatch` prints the
-tally. It aborts only when a job has neither, which means the scripts were
-never generated.
 
 Only the `suffix` / `suffixFly` nuisances need any of this — they read a varied
 copy of the nanoAOD, so they need their own pass. The `weight` ones do not:

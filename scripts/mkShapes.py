@@ -1288,10 +1288,10 @@ if __name__ == '__main__':
     )
     factory.setConditions(opt.silentMode)
 
-    if not any([opt.submitBatch, opt.haddRootFiles, opt.haddBatch, opt.checkBatch,
-                opt.localCompile, opt.parallelCompile, opt.fromSnapshot]):
-        factory.makeNominals()
-
+    # Generating the .cpp is the prerequisite of compiling and of submitting,
+    # and it is cheap and idempotent (_write_if_changed), so it runs for those
+    # too rather than being a separate bare invocation. --checkBatch and the
+    # hadd steps only read what is already on disk.
     if opt.fromSnapshot:
         snapshot_dir = getattr(opt, 'snapshotDir', None) or \
                        getattr(opt, 'folder_where_to_save_trees', None) or \
@@ -1300,6 +1300,8 @@ if __name__ == '__main__':
         files_per_job   = int(getattr(opt, 'snapshotFilesPerJob', 50))
         print(f"fromSnapshot: reading from {snapshot_dir}, {files_per_job} files/job")
         factory.makeFromSnapshot(snapshot_dir, files_per_job=files_per_job)
+    elif not any([opt.haddRootFiles, opt.haddBatch, opt.checkBatch]):
+        factory.makeNominals()
 
     if opt.localCompile:
         subprocess.run(["make", "-j4"])
