@@ -620,10 +620,6 @@ echo "Done at $(date)"; ls -lh
     #  checkBatch — output file is in folder_where_to_save_trees, not outputDir
     # _____________________________________________________________________________
 
-    def _output_file_from_suffix(self, sampleName, subname, suffix):
-        return os.path.join(self._folder_where_to_save_trees,
-                            f"nanoLatino_snapshot____{suffix}.root")
-
     def checkBatch(self, resubmit=False):
         """Override to also mark completed jobs in metadata."""
         super().checkBatch(resubmit=resubmit)
