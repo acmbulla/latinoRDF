@@ -138,7 +138,7 @@ class AnalysisFactory:
       - cuts / categories
       - MaxEventsPerJob / FilesPerJob chunking with parallel event counting + JSON cache
       - split / era event slicing across eras via RDataFrame Range()
-      - submitBatch (optional proxy, precompiled vs compile-on-node, single .sub file)
+      - submitBatch (optional proxy, per-job precompiled vs compile-on-node, one .sub)
       - checkBatch + --resubmit
       - parallelCompile
 
@@ -803,15 +803,13 @@ class AnalysisFactory:
 
         self._prepare_submit_batch(root_cflags, root_libs)
 
-        precompiled = self._detect_precompiled()
-        print(f"  -> {'Pre-compiled' if precompiled else 'Compile-on-node'} mode.")
-
         x509_proxy, proxy_lines = self._check_proxy()
 
         self._pre_count_events()
 
         queue_rows  = []
-        missing_exe = []
+        missing_src = []
+        n_precompiled = 0
 
         for sampleName, sample in self._samples.items():
             os.makedirs(os.path.join(self._script_batch_location, sampleName), exist_ok=True)
@@ -831,23 +829,29 @@ class AnalysisFactory:
                     abs_executable   = os.path.join(name_folder_code, job_name)
                     abs_cpp          = os.path.join(name_folder_code, job_name + ".cpp")
 
-                    if precompiled:
+                    # Per job, not once for the whole submission. The mode used
+                    # to be decided by probing a single nominal executable, so
+                    # compiling the nominal binaries and not the shape-nuisance
+                    # ones put every job in pre-compiled mode and condor refused
+                    # the cluster over a binary that was never built. Shipping
+                    # the .cpp of whatever is not compiled yet is always safe:
+                    # the node compiles it in a minute or two.
+                    if os.path.isfile(abs_executable):
                         bash_code = self._build_bash_precompiled(
                             job_name, out_file, sampleName, subname, proxy_lines,
                             submission_dir, root_cflags, root_libs)
                         job_exe = abs_executable
+                        n_precompiled += 1
                     else:
                         bash_code = self._build_bash_compile_on_node(
                             job_name, out_file, sampleName, subname, proxy_lines,
                             submission_dir, root_cflags, root_libs)
                         job_exe = abs_cpp
-
-                    # transfer_input_files names job_exe, so condor refuses the
-                    # whole cluster if one is absent. In pre-compiled mode that
-                    # happens when only MakefileSnapshot was built and not
-                    # MakefileSnapshotNuisances, which is easy to do.
-                    if not os.path.isfile(job_exe):
-                        missing_exe.append(job_exe)
+                        if not os.path.isfile(abs_cpp):
+                            # neither a binary nor a source: the scripts were
+                            # never generated. transfer_input_files names
+                            # job_exe, so condor would refuse the cluster.
+                            missing_src.append(abs_cpp)
 
                     with open(name_bash, "w") as f:
                         f.write(bash_code)
@@ -863,21 +867,29 @@ class AnalysisFactory:
 
                     queue_rows.append((name_bash, job_exe, output_file, error_file, log_file))
 
-        if missing_exe:
-            print(f"  WARNING: {len(missing_exe)} job input file(s) do not exist yet:")
-            for f in missing_exe[:10]:
+        n_on_node = len(queue_rows) - n_precompiled
+        print(f"  -> {n_precompiled} pre-compiled job(s), {n_on_node} compiling on the node.")
+
+        if missing_src:
+            print(f"  ERROR: {len(missing_src)} job(s) have neither a binary nor a .cpp:")
+            for f in missing_src[:10]:
                 print(f"       {f}")
-            if len(missing_exe) > 10:
-                print(f"       ... and {len(missing_exe) - 10} more")
-            print("           Compile them before the jobs start, or condor will")
-            print("           refuse the cluster on transfer_input_files.")
+            if len(missing_src) > 10:
+                print(f"       ... and {len(missing_src) - 10} more")
+            print("         Generate the scripts first; condor would refuse the")
+            print("         whole cluster over the missing transfer_input_files.")
+            return
 
         # single .sub file
         global_submit_path = os.path.join(self._script_batch_location, "submit_all.sub")
         extra_files     = self._extra_transfer_files
         extra_files_str = (", " + ", ".join(extra_files)) if extra_files else ""
+        # transfer_input_files is one line for every job in the cluster, so when
+        # any job compiles on the node the list has to carry what that needs.
+        # The extra entries are two small files and are ignored by a job that
+        # does not compile.
         fixed_extra = self._clean_transfer_list(
-            self._extra_transfer_files_for_submit(precompiled, x509_proxy, extra_files_str))
+            self._extra_transfer_files_for_submit(n_on_node == 0, x509_proxy, extra_files_str))
 
         queue_lines = "\n".join(
             f"  {exe}, {job_exe}, {out}, {err}, {log}"
@@ -886,7 +898,7 @@ class AnalysisFactory:
 
         submit_code = (
             f"# Auto-generated by {self.__class__.__name__}\n"
-            f"# Mode: {'pre-compiled' if precompiled else 'compile-on-node'}\n\n"
+            f"# {n_precompiled} pre-compiled, {n_on_node} compile-on-node\n\n"
             "should_transfer_files   = YES\n"
             "when_to_transfer_output = ON_EXIT\n"
             "transfer_output_files   = \n"
@@ -919,15 +931,6 @@ class AnalysisFactory:
         """
         return [(self.job_prefix() + "_" + sampleName + "_" + subname + "_" + str(i),
                  self.output_file_name(sampleName, subname, i))]
-
-    def _detect_precompiled(self):
-        for sampleName, sample in self._samples.items():
-            for subname, list_root_files in self._normalize_sample_name(sample['name']).items():
-                if list_root_files:
-                    exe = os.path.join(self._scripts_run_folder, sampleName, subname,
-                                       self.job_prefix() + "_" + sampleName + "_" + subname + "_0")
-                    return os.path.isfile(exe)
-        return False
 
     # Abstract — subclass must implement
     def job_prefix(self):

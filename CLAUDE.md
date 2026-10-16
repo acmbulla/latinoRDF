@@ -196,8 +196,13 @@ Notes:
   `condor_submit` with `cwd=script_batch_location`.
 - Batch script names are derived from the generated `.cpp` filename (not the
   legacy generic `my_script_*`), so jobs are identifiable in the queue.
-- Two compilation modes are detected automatically: **pre-compiled** (binary
-  shipped to the node) and **compile-on-node**.
+- The two compilation modes are chosen **per job**: a job whose binary is
+  already built ships the binary, one whose is not ships its `.cpp` and
+  compiles on the node. So nothing has to be compiled before submitting, and a
+  partially built set is fine. `submitBatch` prints the tally and aborts only
+  when a job has neither a binary nor a `.cpp`, which means its scripts were
+  never generated. `transfer_input_files` is one line for the whole cluster, so
+  when any job compiles on the node the list carries what that needs.
 - EOS copies use `xrdcp -f`; the job creates its output directory with
   `mkdir -p` before the executable runs.
 - **The X509 proxy is optional.** `submitBatch` looks for one
