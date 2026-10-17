@@ -115,14 +115,19 @@ def _report_branches(nuisanceName, direction, mapName, nominal_file, varied_file
     for coll in sorted(touched):
         if coll.startswith('n') and coll[1:] in touched:
             continue
+        counter = 'n' + coll
+        if counter not in nom_set:
+            # No counter branch, so this is not a collection but a family of
+            # per-event scalars: PuppiMET_pt, WH3l_mtWWW, ZH3l_pTZ. A
+            # variation touching some of them and not others is what a
+            # variation is, and there is no length to get wrong.
+            continue
         members_all   = [b for b in nom if b.startswith(coll + '_')]
         members_var   = [b for b in members_all if b in mapped]
         members_fixed = [b for b in members_all if b not in mapped]
         if not members_var and not members_fixed:
             continue
-        counter       = 'n' + coll
-        counter_state = ('varied' if counter in mapped else
-                         'nominal' if counter in nom_set else 'absent')
+        counter_state = 'varied' if counter in mapped else 'nominal'
 
         if counter_state == 'varied' and members_fixed:
             label = 'RESIZED'
