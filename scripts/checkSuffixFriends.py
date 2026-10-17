@@ -74,6 +74,44 @@ def _collection(branch):
     return branch.split('_', 1)[0] if '_' in branch else branch
 
 
+def _counter_vs_length(nominal_file, varied_file, counter, member_branch,
+                       tree_name, nentries=200):
+    """Does the nominal counter agree with the varied array's real length?
+
+    This is the question the branch lists cannot answer. A '_suffix' file
+    stores its arrays with their own count leaf, so the varied collection
+    knows how long it is; the nominal counter branch does not. Reading a few
+    entries settles it, and a single disagreement is enough: the helpers loop
+    over the counter and index the arrays.
+
+    Returns (n_checked, [(entry, counter_value, varied_length), ...]) or None.
+    """
+    fn = ROOT.TFile.Open(nominal_file)
+    fv = ROOT.TFile.Open(varied_file)
+    try:
+        if not fn or fn.IsZombie() or not fv or fv.IsZombie():
+            return None
+        tn, tv = fn.Get(tree_name), fv.Get(tree_name)
+        if not tn or not tv:
+            return None
+        n = min(nentries, tn.GetEntries(), tv.GetEntries())
+        bad = []
+        for i in range(n):
+            tn.GetEntry(i)
+            tv.GetEntry(i)
+            try:
+                c = int(getattr(tn, counter))
+                l = len(getattr(tv, member_branch))
+            except Exception:
+                return None
+            if c != l:
+                bad.append((i, c, l))
+        return n, bad
+    finally:
+        if fn: fn.Close()
+        if fv: fv.Close()
+
+
 def _report_branches(nuisanceName, direction, mapName, nominal_file, varied_file,
                      tree_name):
     """Which columns the variation replaces, and whether any collection is
@@ -101,6 +139,17 @@ def _report_branches(nuisanceName, direction, mapName, nominal_file, varied_file
           + (f", {len(unmatched)} with no nominal counterpart (ignored)"
              if unmatched else ""))
 
+    # A friend branch carrying no suffix shares its name with the nominal one.
+    # RDataFrame resolves a bare name to the main tree, so the friend's copy is
+    # never read -- and if it is the count leaf of a varied array, the loop
+    # bound comes from the nominal tree while the array comes from the friend.
+    shadowed = [b for b in var if not b.endswith(suffix) and b in nom_set]
+    if shadowed:
+        print(f"      SHADOWED  {len(shadowed)} friend branch(es) carry no suffix, "
+              f"so the nominal value is used instead: "
+              f"{', '.join(sorted(shadowed)[:10])}"
+              + (" ..." if len(shadowed) > 10 else ""))
+
     # Two different situations, and only one of them is a bug.
     #
     #   counter varied, some members left nominal -> the collection is RESIZED
@@ -110,7 +159,8 @@ def _report_branches(nuisanceName, direction, mapName, nominal_file, varied_file
     #   counter not varied, some members varied -> the lengths are unchanged
     #   and this is normal: a JES shift moves Jet_pt and Jet_mass, not
     #   Jet_eta. Reported for the record, not as an error.
-    resized = []
+    resized  = []
+    complete = []
     touched = {_collection(c) for c in mapped}
     for coll in sorted(touched):
         if coll.startswith('n') and coll[1:] in touched:
@@ -129,13 +179,51 @@ def _report_branches(nuisanceName, direction, mapName, nominal_file, varied_file
             continue
         counter_state = 'varied' if counter in mapped else 'nominal'
 
+        label = None
+        if counter_state == 'varied' and not members_fixed:
+            # counter and every member replaced: nothing to say, but say it,
+            # because silence otherwise reads the same as 'never touched'
+            complete.append(coll)
+            continue
         if counter_state == 'varied' and members_fixed:
+            # the collection is resized and those members keep the old length
             label = 'RESIZED'
             resized.append(coll)
+        elif counter_state == 'nominal' and members_var:
+            # The counter is stale with respect to the varied arrays. Whether
+            # that is fatal depends on whether the variation resizes the
+            # collection, which the branch lists cannot say -- so measure it
+            # instead of guessing. This is the case that used to go unreported
+            # because members_fixed was empty.
+            probe = sorted(members_var)[0]
+            measured = _counter_vs_length(nominal_file, varied_file, counter,
+                                          mapped[probe], tree_name)
+            if measured is None:
+                label = 'UNMEASURED'
+                resized.append(coll)
+            else:
+                n_checked, bad = measured
+                if bad:
+                    label = 'STALE'
+                    resized.append(coll)
+                    print(f"      STALE   {coll}: n{coll} is nominal while "
+                          f"{len(members_var)} member(s) are varied, and they "
+                          f"disagree in {len(bad)} of the first {n_checked} "
+                          f"entries, e.g. "
+                          + "; ".join(f"entry {e}: n{coll}={c} vs {probe} length {l}"
+                                      for e, c, l in bad[:3]))
+                else:
+                    print(f"      ok      {coll}: n{coll} is nominal but agrees "
+                          f"with the varied arrays over the first {n_checked} "
+                          f"entries")
+                    continue
         elif members_var and members_fixed:
             label = 'partial '
         else:
             continue
+
+        if label in ('STALE',):
+            continue   # already printed above, with the measurement
 
         print(f"      {label} {coll}: counter n{coll} {counter_state}, "
               f"{len(members_var)} member(s) varied, "
@@ -145,6 +233,10 @@ def _report_branches(nuisanceName, direction, mapName, nominal_file, varied_file
         if members_fixed:
             print(f"        nominal: {', '.join(sorted(members_fixed)[:10])}"
                   + (" ..." if len(members_fixed) > 10 else ""))
+
+    if complete:
+        print(f"      complete: {', '.join(complete)} "
+              f"(counter and every member replaced)")
 
     return resized
 
@@ -294,16 +386,20 @@ if __name__ == '__main__':
             print(f"    ... and {len(mismatched) - 40} more")
 
     if partial:
-        print(f"\n  RESIZED COLLECTIONS -- {len(partial)} collection(s) have a varied "
-              f"counter and members left nominal, so those members now have the wrong "
-              f"length. Anything that loops over the counter and indexes the arrays "
-              f"reads out of bounds:")
+        print(f"\n  INCONSISTENT COLLECTIONS -- {len(partial)} collection(s) whose "
+              f"counter and arrays do not describe the same thing. Anything that loops "
+              f"over the counter and indexes the arrays reads out of bounds:")
         for nuisanceName, direction, coll in partial:
             print(f"    {nuisanceName}{direction}  {coll}")
 
     if not missing and not mismatched and not partial:
-        print("\n  All varied files are there, line up with their nominal, and "
-              "replace whole collections.")
+        if opt.existenceOnly:
+            print("\n  All varied files are there. Entry counts NOT compared "
+                  "(--existenceOnly); drop the flag to check them.")
+        else:
+            print("\n  All varied files are there and line up with their nominal.")
+        if opt.branches:
+            print("  No collection is left half varied.")
         sys.exit(0)
 
     sys.exit(1)
