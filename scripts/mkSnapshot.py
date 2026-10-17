@@ -140,6 +140,8 @@ class SnapshotFactory(AnalysisFactory):
         self._script_batch_location      = './scripts_snapshot_batch/'
         self._metadata                   = None
         self._skipShapeNuisances         = False
+        # set only while generating a varied job's .cpp (see makeShapeNuisances)
+        self._suffix_variation           = None
 
     # _____________________________________________________________________________
     def setSkipShapeNuisances(self, skip):
@@ -296,6 +298,62 @@ class SnapshotFactory(AnalysisFactory):
         return out
 
     # _____________________________________________________________________________
+    #  Varied input — the nominal tree, with the suffix folder as a friend
+    # _____________________________________________________________________________
+
+    def _build_cpp_input_files_extra(self, tree_name, file_path, sampleName):
+        """Attach the variation's files as a friend of the nominal chain.
+
+        A '*_suffix' production is not a full nanoAOD: it holds only the
+        branches the variation touches, each named '<nominal branch>_<map>'.
+        Read on its own it defines almost nothing, so the first alias or cut
+        that mentions an ordinary branch dies in the JIT with 'use of
+        undeclared identifier Lepton_pt'. The varied job therefore reads the
+        nominal files and adds the varied ones as a friend, the way mkShapes
+        already does, and _build_cpp_after_df() swaps the columns over.
+        """
+        var = self._suffix_variation
+        if not var:
+            return ""
+        out  = "//  Variation input files (friend of the nominal chain)\n"
+        out += f'    auto* varied_friend = new TChain("{tree_name}");\n'
+        for file_name in var['files']:
+            out += f'    varied_friend->Add("{file_name}");\n'
+        out += f'    nominal->AddFriend(varied_friend, "{var["map"]}");\n'
+        out += '    auto nominalBranches = getBranchNames(nominal);\n'
+        out += '    auto variedBranches  = getBranchNames(varied_friend);\n'
+        out += '    \n'
+        return out
+
+    def _build_cpp_after_df(self, sampleName):
+        """Redefine every nominal column the variation provides.
+
+        Which columns those are is a property of the input files, not of the
+        configuration, so the list is walked on the node at runtime: every
+        friend branch ending in '_<map>' whose nominal counterpart exists is
+        redefined from it. Everything downstream -- aliases, variables, the
+        cut -- then sees varied values under the nominal names, which is what
+        makes the varied snapshot a drop-in friend for mkShapes
+        --fromSnapshot: it reads '<nuisance><Up|Down>.<nominal column>'.
+        """
+        var = self._suffix_variation
+        if not var:
+            return ""
+        out  = "\n//  Replace the nominal columns with their varied counterparts\n"
+        out += f'    const std::string varied_suffix = "_{var["map"]}";\n'
+        out += '    for (const auto& branch : variedBranches) {\n'
+        out += '      if (branch.size() <= varied_suffix.size()) continue;\n'
+        out += '      if (branch.compare(branch.size() - varied_suffix.size(),\n'
+        out += '                         varied_suffix.size(), varied_suffix) != 0) continue;\n'
+        out += '      const std::string nomCol = branch.substr(0, branch.size() - varied_suffix.size());\n'
+        out += '      if (std::find(nominalBranches.begin(), nominalBranches.end(), nomCol)\n'
+        out += '          == nominalBranches.end()) continue;\n'
+        out += '      varied_df = varied_df.Redefine(nomCol, branch);\n'
+        out += '    }\n'
+        out += '    \n'
+        return out
+
+    # _____________________________________________________________________________
     #  Cuts + snapshot — the mkSnapshot-specific output fragment
     # _____________________________________________________________________________
 
@@ -348,7 +406,14 @@ class SnapshotFactory(AnalysisFactory):
         frags = self._build_cpp_common(tree_name, file_path, sampleName, weight,
                                        aliases_ordered or {}, range_start, range_end)
 
-        mt_setting = "ROOT::DisableImplicitMT();" if (range_start is not None and range_end is not None) else "ROOT::EnableImplicitMT();"
+        # A Range() is single-thread by construction. A varied job is run
+        # single-thread too: its input is the nominal chain with a friend
+        # chain attached, and entry-by-entry alignment between the two is
+        # what makes the variation correct -- not worth risking for threads
+        # the batch node does not give us anyway (condor allots 1 CPU).
+        single_thread = ((range_start is not None and range_end is not None)
+                         or self._suffix_variation is not None)
+        mt_setting = "ROOT::DisableImplicitMT();" if single_thread else "ROOT::EnableImplicitMT();"
 
         snapshot_call = f'node_{self._cut_to_dump}.Snapshot("Events", "{output_root_file_name}", columns_to_save);\n'
 
@@ -360,6 +425,9 @@ class SnapshotFactory(AnalysisFactory):
 #include "TH1D.h"
 #include "TDirectory.h"
 #include "TChain.h"
+#include "TTree.h"
+#include "TObjArray.h"
+#include <algorithm>
 #include <map>
 #include <vector>
 #include <iostream>
@@ -373,6 +441,15 @@ ROOT::RDF::RNode SafeDefine(ROOT::RDF::RNode df, std::string name, std::string e
     if (std::find(colNames.begin(), colNames.end(), name) == colNames.end())
         return df.Define(name, expr);
     return df;
+}}
+
+std::vector<std::string> getBranchNames(TTree* tree) {{
+    std::vector<std::string> names;
+    TObjArray* branches = tree->GetListOfBranches();
+    if (!branches) return names;
+    for (int i = 0; i < branches->GetEntries(); ++i)
+        names.push_back(branches->At(i)->GetName());
+    return names;
 }}
 
 {frags['lines_to_add']}
@@ -597,11 +674,11 @@ int main() {{
                             map_name = nuisance[f'map{direction}']
                             folder   = nuisance[f'folder{direction}']
 
-                            # build alternative file list
-                            alt_files = []
-                            for f_path in chunk['files']:
-                                fname = os.path.basename(f_path)
-                                alt_files.append(os.path.join(folder, fname))
+                            # the varied files are a friend of the nominal ones,
+                            # not a replacement for them: see
+                            # _build_cpp_input_files_extra
+                            varied_files = [os.path.join(folder, os.path.basename(f))
+                                            for f in chunk['files']]
 
                             job_name, out_file = self._nuisance_names(
                                 nuisanceName, direction, sampleName, subname, i)
@@ -613,12 +690,21 @@ int main() {{
                             weight = (f"({global_weight}) * ({weights_subname[subname]})"
                                       if subname in weights_subname else global_weight)
 
-                            self.create_cpp_source_list_of_files(
-                                name_code, "Events", alt_files, out_file,
-                                sampleName, weight,
-                                {}, {}, aliases_ordered=aliases_ordered,
-                                range_start=chunk.get('range_start'),
-                                range_end=chunk.get('range_end'))
+                            self._suffix_variation = {
+                                'nuisance' : nuisanceName,
+                                'direction': direction,
+                                'map'      : map_name,
+                                'files'    : varied_files,
+                            }
+                            try:
+                                self.create_cpp_source_list_of_files(
+                                    name_code, "Events", chunk['files'], out_file,
+                                    sampleName, weight,
+                                    {}, {}, aliases_ordered=aliases_ordered,
+                                    range_start=chunk.get('range_start'),
+                                    range_end=chunk.get('range_end'))
+                            finally:
+                                self._suffix_variation = None
 
                             list_of_files_to_compile.append(name_code + ".cpp")
 
