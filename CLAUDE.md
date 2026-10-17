@@ -316,12 +316,27 @@ and then submit only the nominal jobs — a half-run with nothing to say so.
 `makeScripts()` now writes both makefiles, `--localCompile` builds both, and
 `SnapshotFactory.doShapeNuisances()` is the single predicate.
 
-Only the `suffix` / `suffixFly` nuisances need any of this — they read a varied
-copy of the nanoAOD, so they need their own pass. The `weight` ones do not:
+Only the `suffix` / `suffixFly` nuisances need any of this — the variation is
+in the input files, so it needs its own pass. The `weight` ones do not:
 `_build_full_variables_to_dump` already adds a `my_sample_weight_<name>Up` and
 `Down` branch for each of them, so the varied weight is in the nominal tree. At
 148 nuisances that is 258 extra branches, 206 of them PDF, and it dominates the
 file size.
+
+A varied job reads the **nominal** files, with the nuisance's `folderUp` /
+`folderDown` added as a *friend* — not instead of them. A `*_suffix`
+production is not a full nanoAOD: it holds only the branches the variation
+touches, each named `<nominal branch>_<map>` (`CleanJet_pt_jesRegroed_HF_2024up`
+and so on). Read on its own it defines almost nothing, and the first alias or
+cut that mentions an ordinary branch dies in the JIT with `use of undeclared
+identifier 'Lepton_pt'`. So the job attaches the friend, then redefines every
+nominal column the friend provides, walking the friend's branch list on the
+node because which columns those are belongs to the input files, not to the
+configuration. Everything downstream sees varied values under the **nominal**
+names, which is what lets `mkShapes --fromSnapshot` take the varied file as a
+friend and read `<nuisance><Up|Down>.<nominal column>` from it. A varied job
+also runs single-thread: the chain and its friend have to stay aligned entry by
+entry, and the node gives one CPU anyway.
 
 Naming, and why it is in one place. A varied job is
 `my_snapshot_<nuisance><Up|Down>_<sample>_<subname>_<i>` and writes
