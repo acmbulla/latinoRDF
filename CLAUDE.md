@@ -16,7 +16,7 @@ source setup.sh
 
 | Path | Contents |
 |---|---|
-| `scripts/` | The executable framework: `mkShapes.py`, `mkSnapshot.py`, `analysisFactory.py`, `mkPlot.py`, `mkDatacards.py`, `mkMergeYears.py`, `haddfast.py`, `haddnano.py`, `easyDescription.py` |
+| `scripts/` | The executable framework: `mkShapes.py`, `mkSnapshot.py`, `analysisFactory.py`, `mkPlot.py`, `mkDatacards.py`, `mkMergeYears.py`, `haddfast.py`, `haddnano.py`, `easyDescription.py`, `checkSuffixFriends.py` |
 | `lib/` | Plot styling helpers (`tdrStyle.py`, `CMS_lumi.py`) and `search_files.py` |
 | `plotsConfigurationsRDF/` | **Separate git repository** (`acmbulla/plotsConfigurationsRDF`), ignored by this repo via `.gitignore:209`. Holds the per-analysis, per-year configuration files. |
 
@@ -337,6 +337,33 @@ names, which is what lets `mkShapes --fromSnapshot` take the varied file as a
 friend and read `<nuisance><Up|Down>.<nominal column>` from it. A varied job
 also runs single-thread: the chain and its friend have to stay aligned entry by
 entry, and the node gives one CPU anyway.
+
+Before submitting the varied jobs, check what the friends actually contain:
+
+```bash
+checkSuffixFriends.py --pycfg configuration.py              # missing / short friend files
+checkSuffixFriends.py --pycfg configuration.py --branches   # which columns get replaced
+```
+
+Two failure modes it exists for, both of which were real and neither of which
+announces itself:
+
+1. **A missing or shorter `_suffix` file.** The friend is positional, so a job
+   whose friend runs out of entries reads past the end and segfaults in the
+   event loop. A dataset is not guaranteed to exist in every `_suffix` folder.
+2. **A collection replaced only in part.** The job redefines the friend
+   branches whose nominal counterpart exists, and nothing more. If the friend
+   carries `nCleanJet` but not `CleanJet_jetIdx`, the counter says there are
+   more jets than the array holds, and every helper that loops over the
+   counter and indexes the arrays reads out of bounds — which is exactly how
+   `btagSFlight::operator()` died. `--branches` separates that case (`RESIZED`)
+   from the harmless one (`partial`: no varied counter, so the lengths are
+   unchanged — a JES shift moves `Jet_pt`, not `Jet_eta`).
+
+The helpers in `plotsConfigurationsRDF/SSWW/utils/macros/` now bound their
+loops by the array sizes rather than by the counter branch, so case 2 can no
+longer crash; the check still matters, because a varied value read from a
+nominal-length array is wrong rather than fatal.
 
 Naming, and why it is in one place. A varied job is
 `my_snapshot_<nuisance><Up|Down>_<sample>_<subname>_<i>` and writes
