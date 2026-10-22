@@ -737,8 +737,8 @@ int main() {{
     #  submitBatch hooks
     # _____________________________________________________________________________
 
-    def _extra_transfer_files_for_submit(self, precompiled, x509_proxy, extra_files_str):
-        return f"{x509_proxy}{extra_files_str}"
+    def _extra_transfer_files_for_submit(self, precompiled, credentials, extra_files_str):
+        return f"{credentials}{extra_files_str}"
 
     def _build_bash_precompiled(self, job_name, out_file, sampleName, subname,
                                 proxy_lines, submission_dir, root_cflags, root_libs):

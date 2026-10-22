@@ -812,6 +812,83 @@ class AnalysisFactory:
         print("           will fail on the node: voms-proxy-init --voms cms --valid 168:00")
         return "", (f"export EOS_MGM_URL=root://eosuser.cern.ch\n")
 
+    def _check_kerberos(self):
+        """Locate a Kerberos credential cache. Returns ("", "") when there is none.
+
+        Why this is shipped rather than read from /tmp on the node: the
+        execute node is a different machine, and its /tmp is not the submit
+        node's. A job that reads /tmp/krb5cc_<uid> there finds either nothing
+        or, on a shared pool, somebody else's file. So the cache travels in
+        transfer_input_files like the proxy does, and the wrapper points
+        KRB5CCNAME at the sandbox copy.
+
+        That export is not cosmetic. The submit file sets `getenv = True`, so
+        the job inherits KRB5CCNAME from the submitting shell -- a path that
+        does not exist on the node. Without the export, shipping the cache
+        would change nothing.
+
+        Only a FILE cache can be copied. A KEYRING, KCM, DIR or MEMORY cache
+        lives in the kernel or in a daemon and has no file to transfer; that is
+        reported with the way out, and submission continues.
+
+        A ticket is good for about ten hours. Jobs that start after that -- a
+        long queue, or a resubmission the next day -- find it expired and fail
+        their EOS copy, which is why `MY.SendCredential = True` with a
+        credential stored on the schedd is the robust answer for a long
+        campaign. This is the cheap one.
+        """
+        ccname = os.environ.get('KRB5CCNAME', '')
+        if ':' in ccname and not ccname.startswith('FILE:'):
+            kind = ccname.split(':', 1)[0]
+            print(f"  WARNING: KRB5CCNAME is a {kind} cache, which has no file to ship.")
+            print( "           For a copyable one, before submitting:")
+            print( "             kinit -c FILE:/tmp/krb5cc_$(id -u)")
+            print( "             export KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u)")
+            return "", ""
+
+        candidates = [
+            ccname[len('FILE:'):] if ccname.startswith('FILE:') else ccname,
+            f"/tmp/krb5cc_{os.getuid()}",
+        ]
+        cache = next((c for c in candidates if c and os.path.isfile(c)), None)
+        if not cache:
+            print("  -> No Kerberos credential cache found; submitting without one.")
+            return "", ""
+
+        valid = True
+        try:
+            valid = subprocess.run(["klist", "-s", "-c", f"FILE:{cache}"],
+                                   capture_output=True).returncode == 0
+        except FileNotFoundError:
+            print("  -> klist not found, not checking the ticket validity.")
+
+        if not valid:
+            print(f"  WARNING: Kerberos cache {cache} holds no valid ticket.")
+            print( "           Submitting without it: kinit, then resubmit, if the")
+            print( "           job writes to EOS over Kerberos rather than with a proxy.")
+            return "", ""
+
+        basename = os.path.basename(cache)
+        print(f"  -> Kerberos ticket found and valid: {cache}")
+        print( "     Shipped with the job. It expires in hours, not days, so a job")
+        print( "     that starts much later will not have it.")
+        return cache, (f"export KRB5CCNAME=FILE:$(pwd)/{basename}\n"
+                       f"chmod 600 $(pwd)/{basename} 2>/dev/null || true\n"
+                       f"klist 2>/dev/null || true\n")
+
+    def _check_credentials(self):
+        """The credential files to ship, and the lines that point the job at them.
+
+        Both are optional and independent: a grid proxy, a Kerberos ticket,
+        either, or neither. Whatever is there is shipped, nothing is required,
+        and the job fails later with xrootd's own message if it needed what was
+        missing.
+        """
+        x509_proxy, proxy_lines = self._check_proxy()
+        krb_cache,  krb_lines   = self._check_kerberos()
+        credentials = ", ".join(p for p in (x509_proxy, krb_cache) if p)
+        return credentials, krb_lines + proxy_lines
+
     # _____________________________________________________________________________
     #  submitBatch — shared skeleton
     # _____________________________________________________________________________
@@ -832,7 +909,7 @@ class AnalysisFactory:
 
         self._prepare_submit_batch(root_cflags, root_libs)
 
-        x509_proxy, proxy_lines = self._check_proxy()
+        credentials, proxy_lines = self._check_credentials()
 
         self._pre_count_events()
 
@@ -926,7 +1003,7 @@ class AnalysisFactory:
         # The extra entries are two small files and are ignored by a job that
         # does not compile.
         fixed_extra = self._clean_transfer_list(
-            self._extra_transfer_files_for_submit(n_on_node == 0, x509_proxy, extra_files_str))
+            self._extra_transfer_files_for_submit(n_on_node == 0, credentials, extra_files_str))
 
         queue_lines = "\n".join(
             f"  {exe}, {job_exe}, {out}, {err}, {log}"
@@ -976,7 +1053,7 @@ class AnalysisFactory:
     def output_file_name(self, sampleName, subname, i):
         raise NotImplementedError
 
-    def _extra_transfer_files_for_submit(self, precompiled, x509_proxy, extra_files_str):
+    def _extra_transfer_files_for_submit(self, precompiled, credentials, extra_files_str):
         raise NotImplementedError
 
     def _build_bash_precompiled(self, job_name, out_file, sampleName, subname,
@@ -1195,7 +1272,7 @@ class AnalysisFactory:
             return
         print(f"  -> All jobs done, proceeding with hadd ({len(missing)} missing = 0)")
 
-        x509_proxy, proxy_lines = self._check_proxy()
+        credentials, proxy_lines = self._check_credentials()
 
         # resolve absolute output_dir
         if not os.path.isabs(output_dir):
@@ -1263,7 +1340,7 @@ echo "Done at $(date)"; ls -lh
         os.system(f"chmod +x {hadd_sh_path}")
 
         transfer_files = self._clean_transfer_list(
-            f"{hadd_tool_transfer}, {x509_proxy}" if hadd_tool_transfer else x509_proxy)
+            f"{hadd_tool_transfer}, {credentials}" if hadd_tool_transfer else credentials)
 
         hadd_sub = f"""# hadd job for {tag}
 executable              = {hadd_sh_path}

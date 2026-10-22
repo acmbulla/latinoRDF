@@ -1191,10 +1191,10 @@ int main() {{
         self._abs_lib_cpp = abs_lib_cpp
         self._abs_lib_h   = os.path.join(self._scripts_run_folder, "library_utils.h")
 
-    def _extra_transfer_files_for_submit(self, precompiled, x509_proxy, extra_files_str):
+    def _extra_transfer_files_for_submit(self, precompiled, credentials, extra_files_str):
         if precompiled:
-            return f"{self._abs_library}, {x509_proxy}{extra_files_str}"
-        return f"{self._abs_lib_cpp}, {self._abs_lib_h}, {self._abs_library}, {x509_proxy}{extra_files_str}"
+            return f"{self._abs_library}, {credentials}{extra_files_str}"
+        return f"{self._abs_lib_cpp}, {self._abs_lib_h}, {self._abs_library}, {credentials}{extra_files_str}"
 
     def _build_bash_precompiled(self, job_name, out_file, sampleName, subname,
                                 proxy_lines, submission_dir, root_cflags, root_libs):
