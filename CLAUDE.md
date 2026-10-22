@@ -220,8 +220,34 @@ Notes:
   Kerberos too, so a user with EOS access and no grid certificate can submit.
   A proxy *is* needed to read inputs through a CMS redirector
   (`root://xrootd-cms...`, `cms-xrd-global`), which only accepts GSI — without
-  one those jobs fail on the node with an xrootd authentication error. Relying
-  on Kerberos also means the job needs the credential forwarded
+  one those jobs fail on the node with an xrootd authentication error.
+- **The Kerberos ticket is shipped the same way, and is just as optional.**
+  `submitBatch` and the hadd submit look for a credential cache
+  (`$KRB5CCNAME`, `/tmp/krb5cc_<uid>`), check it with `klist -s`, add it to
+  `transfer_input_files` and have the wrapper
+  `export KRB5CCNAME=FILE:$(pwd)/<basename>`. Nothing is required: proxy,
+  ticket, either, or neither, and the job fails later with xrootd's own
+  message if it needed what was missing. `_check_credentials()` is the one
+  place both are assembled.
+
+  Three things about it:
+
+  - **it has to be `transfer_input_files`, not a copy from `/tmp` in the job
+    script.** The execute node is a different machine and its `/tmp` is not
+    the submit node's, so reading `/tmp/krb5cc_<uid>` there finds nothing —
+    or, on a shared pool, somebody else's file.
+  - **the export is what makes it work.** The submit file sets
+    `getenv = True`, so the job inherits `KRB5CCNAME` pointing at the submit
+    node's path. Without pointing it at the sandbox copy, shipping the cache
+    changes nothing.
+  - **only a FILE cache can be copied.** A `KEYRING`, `KCM`, `DIR` or
+    `MEMORY` cache lives in the kernel or in a daemon and has no file to
+    transfer; that is reported, with `kinit -c FILE:/tmp/krb5cc_$(id -u)` as
+    the way out, and submission continues.
+
+  A ticket is good for about ten hours, so a long queue or a resubmission the
+  next day finds it expired. For a campaign that outlives it, the robust
+  answer is still the credential forwarding this does not use
   (`MY.SendCredential = True` in the submit file, with a credential stored on
   the schedd); that is not set by default.
 - `--haddBatch` uses `haddfast.py` for shapes and `haddnano.py` for snapshots.
