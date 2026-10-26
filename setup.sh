@@ -25,4 +25,8 @@ echo "------------------------------------------------"
 
 
 source /cvmfs/sft.cern.ch/lcg/views/LCG_109a/x86_64-el9-gcc13-opt/setup.sh
-export MY_PATH_JOBS="/afs/cern.ch/user/a/abulla/private/LOG1/jobs/latinosRDF"
+if [[ "$(hostname -s)" == lxplus* ]]; then
+    export MY_PATH_JOBS="/afs/cern.ch/user/a/abulla/private/LOG1/jobs/latinosRDF"
+else
+    export MY_PATH_JOBS="/gwpool/users/abulla/private/LOG1/jobs/latinosRDF" 
+fi
