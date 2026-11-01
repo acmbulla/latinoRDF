@@ -160,20 +160,19 @@ class DatacardFactory:
         # divide the list of samples among signal, background and data
         isig = 0
         ibkg = 1
-        for sampleName in self._structure: ### mcortino: I want to use only the samples I put in structures!
-          if sampleName in self._samples:
-            if self._structure[sampleName]['isSignal'] != 0:
-              signal_ids[sampleName] = isig
-              isig -= 1
-            if self._structure[sampleName]['isSignal'] == 2 :
-              alternative_signals.append(sampleName)
-            if self._structure[sampleName]['isSignal'] == 1 :
-              cumulative_signals.append(sampleName)
-            if self._structure[sampleName]['isData'] == 1 :
-              data.append(sampleName)
-            if self._structure[sampleName]['isSignal'] == 0 and self._structure[sampleName]['isData'] == 0:
-              background_ids[sampleName] = ibkg
-              ibkg += 1
+        for sampleName in self._samples:
+          if self._structure[sampleName]['isSignal'] != 0:
+            signal_ids[sampleName] = isig
+            isig -= 1
+          if self._structure[sampleName]['isSignal'] == 2 :
+            alternative_signals.append(sampleName)
+          if self._structure[sampleName]['isSignal'] == 1 :
+            cumulative_signals.append(sampleName)
+          if self._structure[sampleName]['isData'] == 1 :
+            data.append(sampleName)
+          if self._structure[sampleName]['isSignal'] == 0 and self._structure[sampleName]['isData'] == 0:
+            background_ids[sampleName] = ibkg
+            ibkg += 1
 
         print ("Number of Signals:             " + str(len(signal_ids))              )
         print ("Number of Alternative Signals: " + str(len(alternative_signals) - 1) )

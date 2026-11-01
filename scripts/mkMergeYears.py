@@ -354,7 +354,8 @@ class MergerFactory:
 
          exec_context = {'os': os,
                          'samples': {},
-                         'nuisances': {}
+                         'nuisances': {},
+                         'cuts': {} ### mcortino
                         }
          exec(handle_unique, exec_context)
          nuisances = exec_context.get('nuisances', {})
