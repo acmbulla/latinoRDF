@@ -12,11 +12,8 @@ import ROOT
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analysisFactory import (AnalysisFactory, defaultParser, loadDefaultOptions,
-                             read_exec, load_config_files, _SCRIPTS_DIR)
-
-# Variation tags used by RDataFrame Vary(): they end up as suffixes of the histogram names
-# and must match what combine expects ($SYSTEMATIC -> <nuisance>Up / <nuisance>Down).
-TAG_UP, TAG_DOWN = 'Up', 'Down'
+                             read_exec, load_config_files, _SCRIPTS_DIR,
+                             TAG_UP, TAG_DOWN)
 
 
 # -----------------------------------------------------------------------

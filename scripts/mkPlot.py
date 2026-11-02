@@ -19,6 +19,9 @@ import shutil
 
 import ROOT
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from analysisFactory import TAG_UP, TAG_DOWN
+
 # import array
 from array import array
 
@@ -633,11 +636,9 @@ class PlotFactory:
                     continue
 
                   if 'name' in nuisance:
-                    # shapeNameVars = tuple(cutName+"/"+variableName+'/histo_' + sampleName+"_"+nuisance['name']+var for var in ['Up', 'Down'])
-                    shapeNameVars = tuple(cutName+"/"+variableName+'/histo_' + sampleName+"_"+nuisance['name']+var for var in ['up', 'do'])
+                    shapeNameVars = tuple(cutName+"/"+variableName+'/histo_' + sampleName+"_"+nuisance['name']+var for var in (TAG_UP, TAG_DOWN))
                   else:
-                    # shapeNameVars = tuple(cutName+"/"+variableName+'/histo_' + sampleName+"_"+nuisanceName+var for var in ['Up', 'Down'])
-                    shapeNameVars = tuple(cutName+"/"+variableName+'/histo_' + sampleName+"_"+nuisanceName+var for var in ['up', 'do'])
+                    shapeNameVars = tuple(cutName+"/"+variableName+'/histo_' + sampleName+"_"+nuisanceName+var for var in (TAG_UP, TAG_DOWN))
 
                   if 'type' in nuisance and nuisance['type'] == 'lnN':
                     if 'samples' in nuisance:

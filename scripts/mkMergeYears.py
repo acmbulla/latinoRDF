@@ -12,6 +12,9 @@ import tempfile
 
 import ROOT
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from analysisFactory import TAG_UP, TAG_DOWN
+
 
 
 #
@@ -119,7 +122,7 @@ def readFolder(rootFile, folder_name, histo_rename):
 
         # [FEATURE] apply sample rename: check if histoName starts with any old
         # histo prefix. Handles both nominal (histo_DY) and variations
-        # (histo_DY_puWeightup)
+        # (histo_DY_puWeightUp)
         renamed_histoName = histoName
         for old_histo, new_histo in histo_rename.items():
             if histoName == old_histo or histoName.startswith(old_histo + '_'):
@@ -398,7 +401,7 @@ class MergerFactory:
          # Example: {'DY_2024': 'DY', 'top_v2': 'top'}
          sample_rename = folder.get('sampleRename', {})
          # build histo-level rename map: histo_oldName -> histo_newName
-         # also handles nuisance variations: histo_oldName_<nuis>up -> histo_newName_<nuis>up
+         # also handles nuisance variations: histo_oldName_<nuis><Up|Down> -> histo_newName_<nuis><Up|Down>
          year_rename[folderHR] = {f"histo_{old}": f"histo_{new}" for old, new in sample_rename.items()}
 
          old_root_file_name = os.path.join(folder["folder"], "rootFile", folder["tag"], "root_file_joined.root")
@@ -504,8 +507,8 @@ class MergerFactory:
 
                for sampleName, sample in samples.items():
 
-                 nameTempUp   = 'histo_' + str(sampleName) + '_' + (nuisance['name']) + 'up'
-                 nameTempDown = 'histo_' + str(sampleName) + '_' + (nuisance['name']) + 'do'
+                 nameTempUp   = 'histo_' + str(sampleName) + '_' + (nuisance['name']) + TAG_UP
+                 nameTempDown = 'histo_' + str(sampleName) + '_' + (nuisance['name']) + TAG_DOWN
                  nameTemp     = 'histo_' + str(sampleName)
 
                  histos_up_to_be_summed = []
