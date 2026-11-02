@@ -173,7 +173,7 @@ def checkPartials(outputDir, cutNames):
     return missing, present
 
 
-def submitBatch(pycfg, outputDir, cutNames, batchDir="jobsMerge", jobFlavour="workday"):
+def submitBatch(pycfg, outputDir, cutNames, batchDir="jobsMerge", jobFlavour="tomorrow"):
     """Write one condor job per cut and submit them as a single cluster."""
     import subprocess
 

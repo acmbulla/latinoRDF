@@ -802,7 +802,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--silentMode", action='store_true', dest="silentMode",    help="Remove as much as possible the print and the log/err files production")
     parser.add_argument('--sigset'             , dest='sigset'            , help='Signal samples [SM]'                        , default='SM')
-    parser.add_argument('--inputFile'          , dest='inputFile'         , help='input directory'                            , default='./root_file_joined.root')
+    parser.add_argument('--inputFile'          , dest='inputFile'         , help='input directory'                            , default='root_file_joined.root')
     parser.add_argument('--skipMissingNuisance', dest='skipMissingNuisance', help="Don't write nuisance lines when histograms are missing", default=False, action='store_true')
 
 

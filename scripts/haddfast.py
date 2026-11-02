@@ -97,8 +97,6 @@ def merge(indir, outdir, pname=''):
 EOS_HOSTS = {  # first directory under /eos -> XRootD endpoint; extend as needed
     'user': 'root://eosuser.cern.ch',
     'cms': 'root://eoscms.cern.ch',
-    'atlas': 'root://eosatlas.cern.ch',
-    'lhcb': 'root://eoslhcb.cern.ch',
     'project': 'root://eosproject.cern.ch',
     'experiment': 'root://eospublic.cern.ch',
     'public': 'root://eospublic.cern.ch',
