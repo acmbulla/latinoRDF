@@ -12,11 +12,8 @@ import ROOT
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analysisFactory import (AnalysisFactory, defaultParser, loadDefaultOptions,
-                             read_exec, load_config_files, _SCRIPTS_DIR)
-
-# Variation tags used by RDataFrame Vary(): they end up as suffixes of the histogram names
-# and must match what combine expects ($SYSTEMATIC -> <nuisance>Up / <nuisance>Down).
-TAG_UP, TAG_DOWN = 'Up', 'Down'
+                             read_exec, load_config_files, _SCRIPTS_DIR,
+                             TAG_UP, TAG_DOWN)
 
 
 # -----------------------------------------------------------------------
@@ -972,7 +969,7 @@ int main() {{
                 register_variations += f'''    varied_df = varied_df.Vary(
       "my_sample_weight",
       "ROOT::RVecD{{{bUp},{bDo}}}",
-      {{"up", "do"}},
+      {{"{TAG_UP}", "{TAG_DOWN}"}},
       "{nuisanceName}"
     );\n'''
 
@@ -993,7 +990,7 @@ int main() {{
                 register_variations += f'          std::string expr = (col_type.find("RVec") != std::string::npos)\n'
                 register_variations += f'            ? "ROOT::RVec<" + col_type + ">{{" + upCol + ", " + downCol + "}}"\n'
                 register_variations += f'            : "ROOT::RVec<" + col_type + ">{{static_cast<" + col_type + ">(" + upCol + "), static_cast<" + col_type + ">(" + downCol + ")}}";\n'
-                register_variations += f'          varied_df = varied_df.Vary(col, expr, {{"up","do"}}, "{nuisanceName}");\n'
+                register_variations += f'          varied_df = varied_df.Vary(col, expr, {{"{TAG_UP}", "{TAG_DOWN}"}}, "{nuisanceName}");\n'
                 register_variations += f'        }}\n'
                 register_variations += f'      }}\n'
                 register_variations += f'    }}\n'

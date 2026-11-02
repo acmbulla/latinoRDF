@@ -15,6 +15,14 @@ import ROOT
 # directory where analysisFactory.py (and haddfast.py, haddnano.py) live
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Variation tags. They become the suffix of every varied histogram name
+# (histo_<sample>_<nuisance><Up|Down>) and have to match what combine expects
+# for $SYSTEMATIC. Defined here, once, because mkShapes writes them while
+# mkPlot, mkDatacards and mkMergeYears read them back: when the four disagree
+# the producers and the consumers simply stop finding each other's histograms,
+# with no error.
+TAG_UP, TAG_DOWN = 'Up', 'Down'
+
 
 def _base_ns():
     """Base namespace for exec — injects builtins + common modules used in config files."""

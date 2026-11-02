@@ -18,10 +18,8 @@ import shutil
 
 import ROOT
 
-# Variation tags: must be the same as TAG_UP / TAG_DOWN in mkShapes.py.
-# mkShapes writes histo_<sample>_<nuisance><Up|Down>; combine wants the same ($SYSTEMATIC),
-# so they are read and written as-is, with no renaming.
-TAG_UP, TAG_DOWN = 'Up', 'Down'
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from analysisFactory import TAG_UP, TAG_DOWN
 
 
 #
