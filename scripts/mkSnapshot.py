@@ -419,7 +419,7 @@ class SnapshotFactory(AnalysisFactory):
                          or self._suffix_variation is not None)
         mt_setting = "ROOT::DisableImplicitMT();" if single_thread else "ROOT::EnableImplicitMT();"
 
-        snapshot_call = f'node_{self._cut_to_dump}.Snapshot("Events", "{output_root_file_name}", columns_to_save);\n'
+        snapshot_call = f'node_{self._cut_to_dump}.Snapshot("{self._treeName}", "{output_root_file_name}", columns_to_save);\n'
 
         cpp_code = f"""
 #include "ROOT/RDataFrame.hxx"
@@ -588,7 +588,7 @@ int main() {{
                         patch_out   = out_file
 
                     self.create_cpp_source_list_of_files(
-                        name_code, "Events", input_files,
+                        name_code, self._treeName, input_files,
                         patch_out if patch_mode else out_file,
                         sampleName, weight,
                         {}, {}, aliases_ordered=aliases_ordered,
@@ -700,7 +700,7 @@ int main() {{
                             }
                             try:
                                 self.create_cpp_source_list_of_files(
-                                    name_code, "Events", chunk['files'], out_file,
+                                    name_code, self._treeName, chunk['files'], out_file,
                                     sampleName, weight,
                                     {}, {}, aliases_ordered=aliases_ordered,
                                     range_start=chunk.get('range_start'),
