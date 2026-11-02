@@ -18,6 +18,11 @@ import shutil
 
 import ROOT
 
+# Variation tags: must be the same as TAG_UP / TAG_DOWN in mkShapes.py.
+# mkShapes writes histo_<sample>_<nuisance><Up|Down>; combine wants the same ($SYSTEMATIC),
+# so they are read and written as-is, with no renaming.
+TAG_UP, TAG_DOWN = 'Up', 'Down'
+
 
 #
 # default parser
@@ -175,7 +180,7 @@ class DatacardFactory:
         print ("Number of Backgrounds:         " + str(len(background_ids))          )
 
         if not os.path.isdir(self._outputDirDatacard + "/") :
-          os.mkdir(self._outputDirDatacard + "/")
+          os.makedirs(self._outputDirDatacard + "/", exist_ok=True)
 
         # loop over cuts. One directory per cut will be created
         for cutName in self._cuts:
@@ -184,7 +189,7 @@ class DatacardFactory:
             shutil.rmtree(self._outputDirDatacard + "/" + cutName)
           except OSError:
             pass
-          os.mkdir(self._outputDirDatacard + "/" + cutName)
+          os.makedirs(self._outputDirDatacard + "/" + cutName, exist_ok=True)
 
           #
           # prepare the signals and background list of samples
@@ -212,8 +217,8 @@ class DatacardFactory:
             # e.g.    hww2l2v_13TeV_of0j
             #         to be defined in cuts.py
 
-            os.mkdir(self._outputDirDatacard + "/" + cutName + "/" + variableName)
-            os.mkdir(self._outputDirDatacard + "/" + cutName + "/" + variableName + "/shapes/") # and the folder for the root files
+            os.makedirs(self._outputDirDatacard + "/" + cutName + "/" + variableName, exist_ok=True)
+            os.makedirs(self._outputDirDatacard + "/" + cutName + "/" + variableName + "/shapes/", exist_ok=True) # and the folder for the root files
 
             self._outFile = ROOT.TFile.Open(self._outputDirDatacard + "/" + cutName + "/" + variableName + "/shapes/histos_" + tagNameToAppearInDatacard + ".root", 'recreate')
             ROOT.gROOT.GetListOfFiles().Remove(self._outFile)
@@ -392,8 +397,8 @@ class DatacardFactory:
 
                         histo = self._getHisto(cutName, variableName, sampleName)
 
-                        histoUp = histo.Clone('%s_%sup' % (histo.GetName(), nuisance['name']))   # Up
-                        histoDown = histo.Clone('%s_%sdo' % (histo.GetName(), nuisance['name'])) # Down
+                        histoUp = histo.Clone('%s_%s%s' % (histo.GetName(), nuisance['name'], TAG_UP))   # Up
+                        histoDown = histo.Clone('%s_%s%s' % (histo.GetName(), nuisance['name'], TAG_DOWN)) # Down
                         histoUp.SetDirectory(self._outFile)
                         histoDown.SetDirectory(self._outFile)
 
@@ -468,8 +473,9 @@ class DatacardFactory:
                       elif ('all' in nuisance and nuisance['all'] == 1) or \
                               ('samples' in nuisance and sampleName in nuisance['samples']):
                         histo = self._getHisto(cutName, variableName, sampleName)
-                        histoUp = self._getHisto(cutName, variableName, sampleName, '_' + nuisance['name'] + 'up')     # Up
-                        histoDown = self._getHisto(cutName, variableName, sampleName, '_' + nuisance['name'] + 'do') # Down
+                        histoUp = self._getHisto(cutName, variableName, sampleName, '_' + nuisance['name'] + TAG_UP)     # Up
+                        histoDown = self._getHisto(cutName, variableName, sampleName, '_' + nuisance['name'] + TAG_DOWN) # Down
+
 
                         if (not histoUp or not histoDown):
                           print ('Histogram for nuisance', nuisance['name'], 'on sample', sampleName, 'missing')
@@ -670,7 +676,8 @@ class DatacardFactory:
                 if len(nuisance['samples']) != 1:
                   raise RuntimeError('Invalid rateParam: number of samples != 1')
 
-                sampleName, initialValue = nuisance['samples'].items()[0]   # FIXME
+                ###sampleName, initialValue = nuisance['samples'].items()[0]   # FIXME
+                sampleName, initialValue = next(iter(nuisance['samples'].items())) ### mcortino
                 if sampleName not in samples:
                   raise RuntimeError('Invalid rateParam: unknown sample %s' % sampleName)
 
@@ -698,14 +705,17 @@ class DatacardFactory:
 
     # _____________________________________________________________________________
     def _saveNuisanceHistos(self, cutName, variableName, sampleName, suffixIn, suffixOut = None, symmetrize = False):
-        histoUp = self._getHisto(cutName, variableName, sampleName, suffixIn + 'up')     # Up
-        histoDown = self._getHisto(cutName, variableName, sampleName, suffixIn + 'do') # Down
+        histoUp = self._getHisto(cutName, variableName, sampleName, suffixIn + TAG_UP)     # Up
+        histoDown = self._getHisto(cutName, variableName, sampleName, suffixIn + TAG_DOWN) # Down
 
         if not histoUp or not histoDown:
           print ('Up/down histogram for', cutName, variableName, sampleName, suffixIn, 'missing')
           if self._skipMissingNuisance:
             return False
-          # else let ROOT raise
+          raise RuntimeError('Missing up/down histograms for nuisance "%s" (sample %s, cut %s, variable %s): '
+                             'looked for histo_%s%s%s / histo_%s%s%s. Use --skipMissingNuisance to skip them.'
+                             % (suffixIn, sampleName, cutName, variableName,
+                                sampleName, suffixIn, TAG_UP, sampleName, suffixIn, TAG_DOWN))
         if 'scaleSampleForDatacard' in structure[sampleName]:
           scaleFactor = 1.
           if type(structure[sampleName]['scaleSampleForDatacard']) is dict:
@@ -732,14 +742,15 @@ class DatacardFactory:
 
         histoUp.SetDirectory(self._outFile)
         histoDown.SetDirectory(self._outFile)
-        if suffixOut:
-            histoUp.SetName('histo_%s%sup' % (sampleName, suffixOut))      # Up
-            histoDown.SetName('histo_%s%sdo' % (sampleName, suffixOut))  # Down
+        # Output name = histo_<sample><suffix><Up|Down>.
+        # If no suffixOut is given (e.g. skipCMS) the input suffix is kept.
+        outBase = 'histo_%s%s' % (sampleName, suffixOut or suffixIn)
+        histoUp.SetName(outBase + TAG_UP)
+        histoDown.SetName(outBase + TAG_DOWN)
 
         self._outFile.cd()
         histoUp.Write()
         histoDown.Write()
-
         return True
 
     # _____________________________________________________________________________
@@ -791,7 +802,7 @@ if __name__ == '__main__':
 
     parser.add_argument("--silentMode", action='store_true', dest="silentMode",    help="Remove as much as possible the print and the log/err files production")
     parser.add_argument('--sigset'             , dest='sigset'            , help='Signal samples [SM]'                        , default='SM')
-    parser.add_argument('--inputFile'          , dest='inputFile'         , help='input directory'                            , default='./input.root')
+    parser.add_argument('--inputFile'          , dest='inputFile'         , help='input directory'                            , default='root_file_joined.root')
     parser.add_argument('--skipMissingNuisance', dest='skipMissingNuisance', help="Don't write nuisance lines when histograms are missing", default=False, action='store_true')
 
 
@@ -902,14 +913,13 @@ if __name__ == '__main__':
     print ("structure = ", structure)
 
 
-    #
-    # the format is defined in mkShaper.py
-    # FIXME: add it as configurable ...
-    #
-    inputFile = opt.outputDir +"/root_file_joined.root"
+    ###
+    inputFile = opt.outputDir + "/" + opt.inputFile
 
 
     factory = DatacardFactory()
+
+    factory._skipMissingNuisance = opt.skipMissingNuisance
 
     factory.setValues(inputFile, opt.outputDirDatacard, variables, cuts, samples, nuisances, structure)
     # factory.setConditions (opt.silentMode)

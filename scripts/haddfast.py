@@ -94,6 +94,24 @@ def merge(indir, outdir, pname=''):
 
     return nnew, nadd
 
+EOS_HOSTS = {  # first directory under /eos -> XRootD endpoint; extend as needed
+    'user': 'root://eosuser.cern.ch',
+    'cms': 'root://eoscms.cern.ch',
+    'project': 'root://eosproject.cern.ch',
+    'experiment': 'root://eospublic.cern.ch',
+    'public': 'root://eospublic.cern.ch',
+}
+
+def eos_url(path):
+    """Return an xrdcp-able URL if path is on EOS, else None."""
+    if path.startswith('root://'):
+        return path if '/eos/' in path else None   # host already in the URL
+    real = os.path.realpath(path)
+    if not real.startswith('/eos/'):
+        return None
+    host = EOS_HOSTS.get(real.split('/')[2],
+                         os.environ.get('EOS_MGM_URL', 'root://eosuser.cern.ch'))
+    return host + '/' + real
 
 def writeto(sourcePaths, targetPath, eosDownload=False):
     """
@@ -110,12 +128,12 @@ def writeto(sourcePaths, targetPath, eosDownload=False):
 
     for path in sourcePaths:
         pathOrig = path
-        pathReal = os.path.realpath(pathOrig)
-        if eosDownload and pathReal.startswith('/eos'):
+        eosUrl = eos_url(pathOrig) if eosDownload else None # was: pathReal = os.path.realpath(pathOrig)
+        if eosUrl: # was: if eosDownload and pathReal.startswith('/eos'):
             for _ in range(5):
                 with tempfile.NamedTemporaryFile(suffix='.root', delete=False) as tmp:
                     tmpname = tmp.name
-                proc = subprocess.Popen(['xrdcp', '-f', 'root://eoscms.cern.ch/' + pathReal, tmpname])
+                proc = subprocess.Popen(['xrdcp', '-f', eosUrl, tmpname]) # was: proc = subprocess.Popen(['xrdcp', '-f', 'root://eoscms.cern.ch/' + pathReal, tmpname])
                 proc.communicate()
                 if proc.returncode == 0:
                     path = tmpname
@@ -152,7 +170,7 @@ def writeto(sourcePaths, targetPath, eosDownload=False):
             target = ROOT.TFile.Open(targetPath, 'update')
             ROOT.gROOT.GetListOfFiles().Remove(target)
 
-        if eosDownload and pathReal.startswith('/eos'):
+        if eosUrl: # was: eosDownload and pathReal.startswith('/eos'):
             try:
                 os.unlink(path)
             except Exception:

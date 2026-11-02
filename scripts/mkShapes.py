@@ -9,9 +9,14 @@ import subprocess
 import logging
 import ROOT
 
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analysisFactory import (AnalysisFactory, defaultParser, loadDefaultOptions,
                              read_exec, load_config_files, _SCRIPTS_DIR)
+
+# Variation tags used by RDataFrame Vary(): they end up as suffixes of the histogram names
+# and must match what combine expects ($SYSTEMATIC -> <nuisance>Up / <nuisance>Down).
+TAG_UP, TAG_DOWN = 'Up', 'Down'
 
 
 # -----------------------------------------------------------------------
@@ -156,16 +161,18 @@ std::vector<std::string> getBranchNames(TTree* tree) {
     #  nuisances — mkShapes-specific overrides
     # _____________________________________________________________________________
 
-    def _build_cpp_input_files_extra(self, file_path, sampleName):
+    def _build_cpp_input_files_extra(self, file_path, sampleName, tree_name="Events"):
         """Add friend trees for suffix nuisances + getBranchNames calls."""
         out = "    auto nominalBranches = getBranchNames(nominal);\n\n"
         out += "//  Variations input files (if any)\n"
         for nuisanceName, nuisance in self._nuisances.items():
+            #print(nuisanceName) ### mcortino debug
             if (sampleName in nuisance['samples'] and nuisance['type'] == 'shape'
                     and nuisance.get('kind') == 'suffix'):
                 mUp, mDo = nuisance['mapUp'], nuisance['mapDown']
-                out += f'    auto* friend_{mUp} = new TChain("{self._treeName}");\n'
-                out += f'    auto* friend_{mDo} = new TChain("{self._treeName}");\n'
+                #print('---', mUp, mDo) ### mcortino debug
+                out += f'    auto* friend_{mUp} = new TChain("{tree_name}");\n' ### mcortino: {self._treeName} --> {tree_name}
+                out += f'    auto* friend_{mDo} = new TChain("{tree_name}");\n' ### mcortino: {self._treeName} --> {tree_name}
                 for file_name in file_path:
                     fname = file_name[file_name.rfind("/")+1:]
                     out += f'    friend_{mUp}->Add("{nuisance["folderUp"]}/{fname}");\n'
@@ -185,7 +192,7 @@ std::vector<std::string> getBranchNames(TTree* tree) {
                 if first_time_suffix == 0:
                     out += '    int suffix_size = 0;\n'
                     first_time_suffix = 1
-                for (mapName, direction) in [(nuisance['mapUp'], '"up"'), (nuisance['mapDown'], '"do"')]:
+                for (mapName, direction) in [(nuisance['mapUp'], f'"{TAG_UP}"'), (nuisance['mapDown'], f'"{TAG_DOWN}"')]:
                     out += f'    suffix_size = {len(mapName) + 1};\n'
                     out += f'    for (const auto& branch : varBranches_{mapName}) {{\n'
                     out += f'      if (int(branch.size()) >= (suffix_size-1) && branch.compare(branch.size() - (suffix_size-1), (suffix_size-1), "{mapName}") == 0 ) {{\n'
@@ -199,6 +206,7 @@ std::vector<std::string> getBranchNames(TTree* tree) {
                     out += f'        }};\n      }};\n    }};\n\n'
         return out
 
+
     def _build_cpp_variations_weights(self, sampleName, weight):
         out = "//  Register the variations\n"
         for nuisanceName, nuisance in self._nuisances.items():
@@ -209,11 +217,11 @@ std::vector<std::string> getBranchNames(TTree* tree) {
                     if samples_entry[0] in weight:
                         var_up = weight.replace(samples_entry[0], samples_entry[1])
                         var_do = weight.replace(samples_entry[0], samples_entry[2])
-                        out += f'    varied_df = varied_df.Vary("my_sample_weight", "ROOT::RVecD{{{var_up},{var_do}}}", {{"up", "do"}}, "{nuisance["name"]}");\n'
+                        out += f'    varied_df = varied_df.Vary("my_sample_weight", "ROOT::RVecD{{{var_up},{var_do}}}", {{"{TAG_UP}", "{TAG_DOWN}"}}, "{nuisance["name"]}");\n'
                 else:
                     var_up = f"(my_sample_weight) * {samples_entry[0]}"
                     var_do = f"(my_sample_weight) * {samples_entry[1]}"
-                    out += f'    varied_df = varied_df.Vary("my_sample_weight", "ROOT::RVecD{{{var_up},{var_do}}}", {{"up", "do"}}, "{nuisance["name"]}");\n'
+                    out += f'    varied_df = varied_df.Vary("my_sample_weight", "ROOT::RVecD{{{var_up},{var_do}}}", {{"{TAG_UP}", "{TAG_DOWN}"}}, "{nuisance["name"]}");\n'
         return out
 
     def _build_cpp_variations_special(self, sampleName):
@@ -471,13 +479,13 @@ int main() {{
           bool found_avg = false;
           for (auto const& [sp, nn] : map_nuisances_name_for_averaged_histograms) {{
             std::string nu = nn.first; int nv = nn.second;
-            std::regex rup("histo_.*__NORM__.*_" + sp + "up");
-            std::regex rdo("histo_.*__NORM__.*_" + sp + "do");
+            std::regex rup("histo_.*__NORM__.*_" + sp + "{TAG_UP}");
+            std::regex rdo("histo_.*__NORM__.*_" + sp + "{TAG_DOWN}");
             if (std::regex_search(temp_name, rup) || std::regex_search(temp_name, rdo)) {{
               std::string hn = std::regex_replace(std::regex_replace(temp_name, std::regex("__NORM__[0-9]+_"), ""), std::regex(sp), nu);
               histo->SetName(hn.c_str());
               bool isUp = std::regex_search(temp_name, rup);
-              std::string key = isUp ? sp+"up" : sp+"do"; std::string nukey = isUp ? nu+"up" : nu+"do";
+              std::string key = isUp ? sp+"{TAG_UP}" : sp+"{TAG_DOWN}"; std::string nukey = isUp ? nu+"{TAG_UP}" : nu+"{TAG_DOWN}";
               if (auto it = map_nuisances_average_histogram.find(key); it != map_nuisances_average_histogram.end())
                 it->second.Add(histo.get(), 1./nv);
               else {{ map_nuisances_average_histogram[nukey] = (*histo); found_avg = true; break; }}
@@ -590,7 +598,6 @@ int main() {{
             _, _, aliases_ordered = self._build_aliases_ordered(sampleName)
 
             for subname, list_root_files in self._normalize_sample_name(sample['name']).items():
-                print(f"  {sampleName}/{subname}: {len(list_root_files)} files")
                 os.makedirs(self._scripts_run_folder + "/" + sampleName + "/" + subname, exist_ok=True)
 
                 weight = (f"({global_weight}) * ({weights_subname[subname]})"
@@ -752,6 +759,7 @@ if __name__ == '__main__':
         scripts_run_folder    = getattr(opt, 'scripts_run_folder',    None),
         script_batch_location = getattr(opt, 'script_batch_location', None),
         extra_transfer_files  = getattr(opt, 'extra_transfer_files',  None),
+        jobs_config           = getattr(opt, 'jobs_config',           None)
     )
     factory.setConditions(opt.silentMode)
 

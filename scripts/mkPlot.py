@@ -189,7 +189,8 @@ class PlotFactory:
                            extraLegend,
                            plotFancy,
                            NoPreliminary,
-                           RemoveAllMC
+                           RemoveAllMC,
+                           onlyPlot ### mcortino
                       ):
 
         self._silentMode                          = silentMode
@@ -223,6 +224,13 @@ class PlotFactory:
         self._maxLogCdifference                   = self._maxLogCratio
 
 
+        if onlyPlot is not None: ### mcortino
+          if onlyPlot in self._plotsToWrite:
+            self._plotsToWrite = [onlyPlot]
+          else:
+            print('incorrectly specified --onlyPlot. Plotting everything.')
+
+        print ("       self._plotsToWrite                       = ",       self._plotsToWrite                          ) ### mcortino
         print ("       self._silentMode                         = ",       self._silentMode                            )
         print ("       self._scaleToPlot                        = ",       self._scaleToPlot                           )
         print ("       self._minLogC                            = ",       self._minLogC                               )
@@ -263,7 +271,7 @@ class PlotFactory:
 
         self.defineStyle()
 
-        os.system ("mkdir " + self._outputDirPlots + "/")
+        os.system ("mkdir -p " + self._outputDirPlots + "/")
 
         #
         # prepare index.php
@@ -3179,8 +3187,10 @@ if __name__ == '__main__':
                            opt.extraLegend,
                            opt.plotFancy,
                            opt.NoPreliminary,
-                           opt.RemoveAllMC
+                           opt.RemoveAllMC,
+                           opt.onlyPlot ### mcortino
                            )
+      
 
 
 
