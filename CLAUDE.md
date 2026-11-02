@@ -32,6 +32,12 @@ The configured shell wraps `grep` with `--ignore-files`, which honours
 Use `command grep -r ...` (or `git grep` inside the nested repo) when searching
 configuration files.
 
+Upstream documents this checkout as a *sibling* of latinoRDF
+(`<parent>/latinoRDF` and `<parent>/plotsConfigurationsRDF`) and dropped the
+`.gitignore` entry accordingly. Ours is nested and the entry is kept, which is
+what stops a careless `git add -A` from swallowing the configuration repo. If
+you ever move to the sibling layout, that line becomes dead rather than wrong.
+
 ---
 
 ## 2. Scripts and their purpose
@@ -419,6 +425,29 @@ nominal scaled by its `lnN` value stands in. `DATA` gets no variations.
 ```
 mkMergeYears.py --pycfg merge_configuration.py     # everything locally
 ```
+
+### `foldersToMerge` — one entry per year
+
+```python
+foldersToMerge = {
+  "2022" : {
+    "folder" : "../2022",             # the year's analysis directory
+    "tag"    : "261012_22",           # its tag, i.e. rootFile/<tag>/
+  },
+  "2024" : {
+    "folder" : "../2024",
+    "tag"    : "261012_24",
+    # optional: the same physical process is named differently in this year.
+    # Maps old -> new, and renames histo_<old> plus every one of its nuisance
+    # variations (histo_<old>_<nuis>up/down) before the sum.
+    "sampleRename" : {"WZJJ_QCD_v2": "WZJJ_QCD", "DY_2024": "DY"},
+  },
+}
+```
+
+Each year is read from `<folder>/rootFile/<tag>/root_file_joined.root`, copied
+locally first (`xrdcp` for EOS paths, `cp` otherwise). `outputDir` and
+`plotDir` from the merge configuration say where the result goes.
 
 ### Output naming
 

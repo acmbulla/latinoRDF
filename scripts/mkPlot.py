@@ -190,7 +190,8 @@ class PlotFactory:
                            extraLegend,
                            plotFancy,
                            NoPreliminary,
-                           RemoveAllMC
+                           RemoveAllMC,
+                           onlyPlot ### mcortino
                       ):
 
         self._silentMode                          = silentMode
@@ -224,6 +225,13 @@ class PlotFactory:
         self._maxLogCdifference                   = self._maxLogCratio
 
 
+        if onlyPlot is not None: ### mcortino
+          if onlyPlot in self._plotsToWrite:
+            self._plotsToWrite = [onlyPlot]
+          else:
+            print('incorrectly specified --onlyPlot. Plotting everything.')
+
+        print ("       self._plotsToWrite                       = ",       self._plotsToWrite                          ) ### mcortino
         print ("       self._silentMode                         = ",       self._silentMode                            )
         print ("       self._scaleToPlot                        = ",       self._scaleToPlot                           )
         print ("       self._minLogC                            = ",       self._minLogC                               )
@@ -264,7 +272,7 @@ class PlotFactory:
 
         self.defineStyle()
 
-        os.system ("mkdir " + self._outputDirPlots + "/")
+        os.system ("mkdir -p " + self._outputDirPlots + "/")
 
         #
         # prepare index.php
@@ -1510,8 +1518,8 @@ class PlotFactory:
             frameRatio.GetYaxis().SetTitle("Data/Expected")
             #frameRatio.GetYaxis().SetTitle("Data/MC")
             #frameRatio.GetYaxis().SetRangeUser( 0.0, 2.0 )
-            frameRatio.GetYaxis().SetRangeUser( 0.8, 1.2 )
-            # frameRatio.GetYaxis().SetRangeUser( 0.5, 1.5 )
+            # frameRatio.GetYaxis().SetRangeUser( 0.8, 1.2 )
+            frameRatio.GetYaxis().SetRangeUser( 0.5, 1.5 )
             self.Pad2TAxis(frameRatio)
             #                               if there is "histo_total" there is no need of explicit nuisances
             # if (not self._removeMCStat)  or len(mynuisances.keys()) != 0 or histo_total!= None:
@@ -3180,8 +3188,10 @@ if __name__ == '__main__':
                            opt.extraLegend,
                            opt.plotFancy,
                            opt.NoPreliminary,
-                           opt.RemoveAllMC
+                           opt.RemoveAllMC,
+                           opt.onlyPlot ### mcortino
                            )
+      
 
 
 

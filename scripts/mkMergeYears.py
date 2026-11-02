@@ -173,7 +173,7 @@ def checkPartials(outputDir, cutNames):
     return missing, present
 
 
-def submitBatch(pycfg, outputDir, cutNames, batchDir="jobsMerge", jobFlavour="workday"):
+def submitBatch(pycfg, outputDir, cutNames, batchDir="jobsMerge", jobFlavour="tomorrow"):
     """Write one condor job per cut and submit them as a single cluster."""
     import subprocess
 
@@ -309,7 +309,7 @@ class MergerFactory:
 
        self._cuts = list_cuts
 
-       # The loop below runs over list_cuts, not over the raw cuts dict, so a cut
+       # The merge loop runs over list_cuts, not over the raw cuts dict, so a cut
        # carrying 'categories' contributes its unrolled sub-regions too. cutSubset
        # restricts the merge to part of that list: this is how a batch job gets its
        # own slice, and because the slices are disjoint folders in the output the
@@ -321,8 +321,6 @@ class MergerFactory:
                             % (", ".join(unknown), ", ".join(list_cuts)))
          list_cuts = {c: list_cuts[c] for c in cutSubset}
          print("Merging only: %s" % ", ".join(list_cuts))
-
-       cuts = list_cuts
 
 
        new_list_of_nuisances = nuisances
@@ -356,7 +354,8 @@ class MergerFactory:
 
          exec_context = {'os': os,
                          'samples': {},
-                         'nuisances': {}
+                         'nuisances': {},
+                         'cuts': {} ### mcortino
                         }
          exec(handle_unique, exec_context)
          nuisances = exec_context.get('nuisances', {})
@@ -449,7 +448,7 @@ class MergerFactory:
        # splits by cut for the batch rather than being optimised further here.
        #
 
-       for cutName in cuts :
+       for cutName in list_cuts :
          for variableName, variable in variables.items():
            folder_name = cutName + "/" + variableName
 
