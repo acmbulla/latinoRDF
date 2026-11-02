@@ -213,14 +213,21 @@ std::vector<std::string> getBranchNames(TTree* tree) {
             if (sampleName in nuisance['samples'] and nuisance['type'] == 'shape'
                     and nuisance.get('kind') == 'weight'):
                 samples_entry = nuisance['samples'][sampleName]
+                # The configuration expressions are parenthesised before they
+                # are spliced into a product. Without that, a factor that is
+                # not a primary expression rebinds: a ternary such as
+                # 'v.size() > 0 ? v[0] : 1.' becomes
+                # '((w * v.size()) > 0) ? v[0] : 1.', because * binds tighter
+                # than > and > tighter than ?:, so the nominal weight is
+                # dropped and the variation is filled with the bare ratio.
                 if len(samples_entry) == 3:
                     if samples_entry[0] in weight:
-                        var_up = weight.replace(samples_entry[0], samples_entry[1])
-                        var_do = weight.replace(samples_entry[0], samples_entry[2])
+                        var_up = weight.replace(samples_entry[0], f"({samples_entry[1]})")
+                        var_do = weight.replace(samples_entry[0], f"({samples_entry[2]})")
                         out += f'    varied_df = varied_df.Vary("my_sample_weight", "ROOT::RVecD{{{var_up},{var_do}}}", {{"{TAG_UP}", "{TAG_DOWN}"}}, "{nuisance["name"]}");\n'
                 else:
-                    var_up = f"(my_sample_weight) * {samples_entry[0]}"
-                    var_do = f"(my_sample_weight) * {samples_entry[1]}"
+                    var_up = f"(my_sample_weight) * ({samples_entry[0]})"
+                    var_do = f"(my_sample_weight) * ({samples_entry[1]})"
                     out += f'    varied_df = varied_df.Vary("my_sample_weight", "ROOT::RVecD{{{var_up},{var_do}}}", {{"{TAG_UP}", "{TAG_DOWN}"}}, "{nuisance["name"]}");\n'
         return out
 
@@ -292,9 +299,9 @@ std::vector<std::string> getBranchNames(TTree* tree) {
                         if 'cut' in sub_cut_name:
                             out += f'    ROOT::RDF::RNode node_{this_cutName}___{sampleName}_{sub_name} = node_{this_cutName}.Filter("{sub_cut_name["cut"]}", "cut_{sampleName}_{sub_name}");\n'
                             if 'weight' in sub_cut_name:
-                                out += f'    node_{this_cutName}___{sampleName}_{sub_name} = SafeDefine(node_{this_cutName}___{sampleName}_{sub_name}, "my_sample_weight_{sampleName}_{sub_name}", "(my_sample_weight)*{sub_cut_name["weight"]}");\n'
+                                out += f'    node_{this_cutName}___{sampleName}_{sub_name} = SafeDefine(node_{this_cutName}___{sampleName}_{sub_name}, "my_sample_weight_{sampleName}_{sub_name}", "(my_sample_weight)*({sub_cut_name["weight"]})");\n'
                         elif 'weight' in sub_cut_name:
-                            out += f'    node_{this_cutName} = SafeDefine(node_{this_cutName}, "my_sample_weight_{sampleName}_{sub_name}", "(my_sample_weight)*{sub_cut_name["weight"]}");\n'
+                            out += f'    node_{this_cutName} = SafeDefine(node_{this_cutName}, "my_sample_weight_{sampleName}_{sub_name}", "(my_sample_weight)*({sub_cut_name["weight"]})");\n'
 
                 for variableName, variable in self._variables.items():
                     variable_range = variable['range']

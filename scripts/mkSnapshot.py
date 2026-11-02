@@ -128,15 +128,19 @@ class SnapshotFactory(AnalysisFactory):
                     and nuisance.get('kind') == 'weight'
                     and sampleName in nuisance.get('samples', {})):
                 samples_entry = nuisance['samples'][sampleName]
+                # Parenthesised for the same reason as in mkShapes.py: a
+                # factor that is not a primary expression, a ternary above
+                # all, rebinds around the product and drops the nominal
+                # weight.
                 if len(samples_entry) == 3:
                     if samples_entry[0] in weight:
-                        var_up = weight.replace(samples_entry[0], samples_entry[1])
-                        var_do = weight.replace(samples_entry[0], samples_entry[2])
+                        var_up = weight.replace(samples_entry[0], f"({samples_entry[1]})")
+                        var_do = weight.replace(samples_entry[0], f"({samples_entry[2]})")
                     else:
                         continue
                 else:
-                    var_up = f"({weight}) * {samples_entry[0]}"
-                    var_do = f"({weight}) * {samples_entry[1]}"
+                    var_up = f"({weight}) * ({samples_entry[0]})"
+                    var_do = f"({weight}) * ({samples_entry[1]})"
                 out += f'    varied_df = SafeDefine(varied_df, "my_sample_weight_{nuisanceName}Up",   "{var_up}");\n'
                 out += f'    varied_df = SafeDefine(varied_df, "my_sample_weight_{nuisanceName}Down", "{var_do}");\n'
         return out
