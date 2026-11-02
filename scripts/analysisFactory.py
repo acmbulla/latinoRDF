@@ -138,7 +138,7 @@ class AnalysisFactory:
       - cuts / categories
       - MaxEventsPerJob / FilesPerJob chunking with parallel event counting + JSON cache
       - split / era event slicing across eras via RDataFrame Range()
-      - submitBatch (proxy check, precompiled vs compile-on-node, single .sub file)
+      - submitBatch (optional proxy, precompiled vs compile-on-node, single .sub file)
       - checkBatch + --resubmit
       - parallelCompile
 
@@ -171,15 +171,45 @@ class AnalysisFactory:
         self._scripts_run_folder    = 'scripts_run'
         self._silentMode = False
         self._extra_transfer_files  = []
+        self._jobs_config = self._resolve_jobs_config()
 
     def __del__(self):
         pass
+
+
+    ### customizable job parameters (jobFlavour and request_memory).
+    # configuration.py should have a dictionary like the one below, 
+    # which is assumed as default in absence of a custom one
+    DEFAULT_JOBS_CONFIG = { # default values 
+        'submitBatch':     {'jobFlavour': 'longlunch', 'request_memory': '3000'},
+        'haddBatch':       {'jobFlavour': 'longlunch', 'request_memory': '3000'},
+        'parallelCompile': {'jobFlavour': 'longlunch', 'request_memory': '3000'},
+    }
+    @classmethod
+    def _resolve_jobs_config(cls, jobs_config=None):
+        jobs_config = jobs_config or {}
+        unknown = set(jobs_config) - set(cls.DEFAULT_JOBS_CONFIG)
+        if unknown:
+            raise ValueError(f"jobs_config: unknown keys {sorted(unknown)}; "
+                             f"allowed: {sorted(cls.DEFAULT_JOBS_CONFIG)}")
+        resolved = {}
+        for key, defaults in cls.DEFAULT_JOBS_CONFIG.items():
+            user = jobs_config.get(key) or {}
+            if not isinstance(user, dict):
+                raise ValueError(f"jobs_config['{key}'] must be a dict, got {user!r}")
+            bad = set(user) - set(defaults)
+            if bad:
+                raise ValueError(f"jobs_config['{key}']: unknown keys {sorted(bad)}; "
+                                 f"allowed: {sorted(defaults)}")
+            resolved[key] = {**defaults, **user}
+        return resolved
 
     # _____________________________________________________________________________
     def setValues(self, outputDir, variables, cuts, supercut, samples, nuisances,
                   aliases, lumi,
                   scripts_run_folder=None, script_batch_location=None,
-                  extra_transfer_files=None):
+                  extra_transfer_files=None,
+                  jobs_config=None):
         self._variables  = variables
         self._samples    = samples
         self._cuts       = cuts
@@ -195,6 +225,8 @@ class AnalysisFactory:
             self._script_batch_location = os.path.expandvars(script_batch_location)
         if extra_transfer_files is not None:
             self._extra_transfer_files = [os.path.expandvars(f) for f in extra_transfer_files]
+
+        self._jobs_config = self._resolve_jobs_config(jobs_config)
 
     def setConditions(self, silentMode):
         self._silentMode = silentMode
@@ -575,7 +607,7 @@ class AnalysisFactory:
 
         # ---- weights ----
         define_weights = f"//  weights needed\n"
-        define_weights += f'    varied_df = SafeDefine(varied_df, "my_sample_weight", "{weight}");\n'
+        define_weights += f'    varied_df = SafeDefine(varied_df, "my_sample_weight", "static_cast<double>({weight})");\n' ### mcortino: added the static cast to double
 
         # ---- aliases + functions in order ----
         code_of_function_to_include = ""
@@ -730,29 +762,58 @@ class AnalysisFactory:
             return f"xrdcp -f {src} root://eosuser.cern.ch//{dest_normalized}/{out_file}"
         return f"cp {src} {dest_dir}/"
 
+    @staticmethod
+    def _clean_transfer_list(files_str):
+        """Drop the empty entries of a comma-separated transfer_input_files list.
+
+        The proxy is optional, so the hooks that build these lists can hand us
+        an empty slot where it used to be.
+        """
+        return ", ".join(f.strip() for f in files_str.split(',') if f.strip())
+
     def _check_proxy(self):
+        """Locate an X509 proxy. Returns ("", lines) when there is none.
+
+        A proxy is *not* required to reach CERN EOS: xrdcp to eosuser/eoscms
+        authenticates with Kerberos as well, so a user with EOS access and no
+        grid certificate can still submit. It *is* required to read input files
+        through a CMS redirector (root://xrootd-cms..., cms-xrd-global), which
+        only accepts GSI. So a missing proxy is a warning, not an error, and the
+        job fails later with a clear xrootd message if the inputs do need one.
+        """
         _proxy_candidates = [
             os.environ.get('X509_USER_PROXY', ''),
             os.path.expanduser('~/.proxy'),
             f"/tmp/x509up_u{os.getuid()}",
         ]
         x509_proxy = next((p for p in _proxy_candidates if p and os.path.exists(p)), None)
-        if not x509_proxy:
-            print("ERROR: no X509 proxy found.")
-            print("       Please run: voms-proxy-init --voms cms --valid 168:00")
-            return None, None
-        proxy_check = subprocess.run(["voms-proxy-info", "--exists", "--valid", "1:00"],
-                                     capture_output=True)
-        if proxy_check.returncode != 0:
-            print(f"ERROR: proxy found at {x509_proxy} but it is expired or invalid.")
-            print("       Please run: voms-proxy-init --voms cms --valid 168:00")
-            return None, None
-        proxy_basename = os.path.basename(x509_proxy)
-        proxy_lines = (f"export X509_USER_PROXY=$(pwd)/{proxy_basename}\n"
-                       f"export EOS_MGM_URL=root://eosuser.cern.ch\n"
-                       f"voms-proxy-info\n")
-        print(f"  -> X509 proxy found and valid: {x509_proxy}")
-        return x509_proxy, proxy_lines
+
+        valid = False
+        if x509_proxy:
+            try:
+                valid = subprocess.run(["voms-proxy-info", "--exists", "--valid", "1:00"],
+                                       capture_output=True).returncode == 0
+            except FileNotFoundError:
+                # no voms client on this machine: the file is all we can judge by
+                valid = True
+                print("  -> voms-proxy-info not found, not checking the proxy validity.")
+
+        if x509_proxy and valid:
+            proxy_basename = os.path.basename(x509_proxy)
+            proxy_lines = (f"export X509_USER_PROXY=$(pwd)/{proxy_basename}\n"
+                           f"export EOS_MGM_URL=root://eosuser.cern.ch\n"
+                           f"voms-proxy-info\n")
+            print(f"  -> X509 proxy found and valid: {x509_proxy}")
+            return x509_proxy, proxy_lines
+
+        if x509_proxy:
+            print(f"  WARNING: proxy found at {x509_proxy} but it is expired or invalid.")
+        else:
+            print("  WARNING: no X509 proxy found.")
+        print("           Submitting without one. EOS access over Kerberos is")
+        print("           unaffected, but reading inputs through a CMS redirector")
+        print("           will fail on the node: voms-proxy-init --voms cms --valid 168:00")
+        return "", (f"export EOS_MGM_URL=root://eosuser.cern.ch\n")
 
     # _____________________________________________________________________________
     #  submitBatch — shared skeleton
@@ -778,8 +839,6 @@ class AnalysisFactory:
         print(f"  -> {'Pre-compiled' if precompiled else 'Compile-on-node'} mode.")
 
         x509_proxy, proxy_lines = self._check_proxy()
-        if x509_proxy is None:
-            return
 
         self._pre_count_events()
 
@@ -833,7 +892,8 @@ class AnalysisFactory:
         global_submit_path = os.path.join(self._script_batch_location, "submit_all.sub")
         extra_files     = self._extra_transfer_files
         extra_files_str = (", " + ", ".join(extra_files)) if extra_files else ""
-        fixed_extra = self._extra_transfer_files_for_submit(precompiled, x509_proxy, extra_files_str)
+        fixed_extra = self._clean_transfer_list(
+            self._extra_transfer_files_for_submit(precompiled, x509_proxy, extra_files_str))
 
         queue_lines = "\n".join(
             f"  {exe}, {job_exe}, {out}, {err}, {log}"
@@ -848,7 +908,8 @@ class AnalysisFactory:
             "transfer_output_files   = \n"
             f"transfer_input_files    = $(job_exe), {fixed_extra}\n"
             "getenv                  = True\n"
-            "+JobFlavour             = \"longlunch\"\n\n"
+            f"+JobFlavour             = \"{self._jobs_config['submitBatch']['jobFlavour']}\"\n"
+            f"request_memory          = {self._jobs_config['submitBatch']['request_memory']}\n\n"
             "queue executable, job_exe, output, error, log from (\n"
             + queue_lines + "\n)\n"
         )
@@ -984,10 +1045,16 @@ class AnalysisFactory:
         with open(submit_all_path, 'r') as f:
             all_lines = f.readlines()
 
+        ### updated cycle: if --resubmit is called after jobs_config has changed, the submit file is updated
         header_lines = []
         for line in all_lines:
+            s = line.strip()
+            if s.startswith("+JobFlavour"):
+                line = f"+JobFlavour             = \"{self._jobs_config['submitBatch']['jobFlavour']}\"\n"
+            elif s.startswith("request_memory"):
+                line = f"request_memory          = {self._jobs_config['submitBatch']['request_memory']}\n"
             header_lines.append(line)
-            if line.strip().startswith("queue executable"):
+            if s.startswith("queue executable"):
                 break
 
         exe_to_entry = {}
@@ -1100,14 +1167,14 @@ class AnalysisFactory:
         print(f"  -> All jobs done, proceeding with hadd ({len(missing)} missing = 0)")
 
         x509_proxy, proxy_lines = self._check_proxy()
-        if x509_proxy is None:
-            return
 
         # resolve absolute output_dir
         if not os.path.isabs(output_dir):
             output_dir = os.path.join(submission_dir, output_dir)
+        output_dir = os.path.realpath(output_dir)   # <-- NEW: follow AFS -> EOS symlink ### mcortino
         output_dir_normalized = _re.sub(r'^/eos/home-([a-z])/',
                                          lambda m: f"/eos/user/{m.group(1)}/", output_dir)
+
 
         # driven by samples.py, never by whatever is in output_dir. Files from
         # a previous configuration carry the same histogram folder and
@@ -1168,9 +1235,8 @@ echo "Done at $(date)"; ls -lh
             f.write(hadd_sh)
         os.system(f"chmod +x {hadd_sh_path}")
 
-        transfer_files = x509_proxy
-        if hadd_tool_transfer:
-            transfer_files = f"{hadd_tool_transfer}, {x509_proxy}"
+        transfer_files = self._clean_transfer_list(
+            f"{hadd_tool_transfer}, {x509_proxy}" if hadd_tool_transfer else x509_proxy)
 
         hadd_sub = f"""# hadd job for {tag}
 executable              = {hadd_sh_path}
@@ -1182,7 +1248,8 @@ output                  = {self._script_batch_location}/hadd_{tag}.out
 error                   = {self._script_batch_location}/hadd_{tag}.err
 log                     = {self._script_batch_location}/hadd_{tag}.log
 getenv                  = True
-+JobFlavour             = "workday"
++JobFlavour             = "{self._jobs_config['haddBatch']['jobFlavour']}"
+request_memory          = {self._jobs_config['haddBatch']['request_memory']}
 queue
 """
         with open(hadd_sub_path, "w") as f:
@@ -1229,7 +1296,8 @@ executable            = {name_bash}
 error                 = /dev/null
 log                   = /dev/null
 getenv                = True
-+JobFlavour           = "longlunch"
++JobFlavour           = "{self._jobs_config['parallelCompile']['jobFlavour']}"
+request_memory        = {self._jobs_config['parallelCompile']['request_memory']}
 queue
 """
             with open(name_submit, "w") as f:
