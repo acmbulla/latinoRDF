@@ -13,7 +13,7 @@ import tempfile
 import ROOT
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from analysisFactory import TAG_UP, TAG_DOWN
+from analysisFactory import TAG_UP, TAG_DOWN, AnalysisFactory
 
 
 
@@ -189,6 +189,14 @@ def submitBatch(pycfg, outputDir, cutNames, batchDir="jobsMerge", jobFlavour="to
     pycfg_abs = os.path.abspath(pycfg)
     workdir = os.getcwd()
 
+    # These jobs xrdcp every year's root_file_joined.root off EOS, so they need
+    # the same credentials as the mkShapes and mkSnapshot jobs. Both are
+    # optional and neither is required; whatever exists is shipped. Without
+    # this the submit file's `getenv = True` leaves KRB5CCNAME pointing at the
+    # submit node's /tmp, which does not exist on the execute node, and the
+    # copy fails there with an xrootd authentication error.
+    credentials, cred_lines = AnalysisFactory._check_credentials()
+
     sh_path = os.path.join(batchDir, "merge_one_cut.sh")
     with open(sh_path, "w") as f:
         f.write(
@@ -196,6 +204,7 @@ def submitBatch(pycfg, outputDir, cutNames, batchDir="jobsMerge", jobFlavour="to
             'set -e\n'
             'CUT=$1\n'
             'echo "merge job for cut $CUT started at $(date) on $(hostname)"\n'
+            + cred_lines +
             'cd ' + workdir + '\n'
             'python ' + script_path + ' \\\n'
             '    --pycfg ' + pycfg_abs + ' \\\n'
@@ -217,7 +226,8 @@ def submitBatch(pycfg, outputDir, cutNames, batchDir="jobsMerge", jobFlavour="to
             'error                   = ' + batchDir + '/merge_$(cutname).err\n'
             'log                     = ' + batchDir + '/merge_$(cutname).log\n'
             'getenv                  = True\n'
-            '+JobFlavour             = "' + jobFlavour + '"\n'
+            + ('transfer_input_files    = ' + credentials + '\n' if credentials else '')
+            + '+JobFlavour             = "' + jobFlavour + '"\n'
             '\n'
             'queue cutname in (\n'
         )
