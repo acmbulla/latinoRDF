@@ -337,8 +337,8 @@ class SnapshotFactory(AnalysisFactory):
         friend branch ending in '_<map>' whose nominal counterpart exists is
         redefined from it. Everything downstream -- aliases, variables, the
         cut -- then sees varied values under the nominal names, which is what
-        makes the varied snapshot a drop-in friend for mkShapes
-        --fromSnapshot: it reads '<nuisance><Up|Down>.<nominal column>'.
+        makes the varied snapshot usable as a friend of the nominal one: a
+        reader attaches it and gets '<nuisance><Up|Down>.<nominal column>'.
         """
         var = self._suffix_variation
         if not var:

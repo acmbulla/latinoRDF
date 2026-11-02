@@ -67,10 +67,9 @@ Subclasses must implement `job_prefix()`, `output_file_name()`, `makeScripts()`,
 
 ### `mkShapes.py` — histogram production (`ShapeFactory`)
 Generates and runs the C++ that fills histograms for every
-sample × cut × variable × nuisance. Reads nanoAOD directly, or existing
-snapshots via `makeFromSnapshot()` (`--fromSnapshot`).
+sample × cut × variable × nuisance. Reads nanoAOD directly.
 
-Options: `--parallelCompile`, `--localCompile`, `--fromSnapshot`,
+Options: `--parallelCompile`, `--localCompile`,
 `--submitBatch`, `--hadd`, `--haddBatch`, `--checkBatch`, `--resubmit`,
 `--silentMode`.
 
@@ -273,9 +272,8 @@ Notes:
   `os.listdir`. Anything left over is listed and skipped, never merged. See
   "Stale per-job files" below for why this is not a convenience.
 - For snapshots the merged file is `snapshot_<tag>.root`, deliberately *not*
-  matching `nanoLatino_snapshot____*.root`, since `makeFromSnapshot` globs that
-  pattern per sample and would otherwise read the merged file alongside its
-  own parts.
+  matching the per-job pattern `nanoLatino_snapshot____*.root`, so anything
+  globbing the parts cannot pick up the merged file alongside them.
 - Compilation links ROOT (`root-config --cflags/--libs`) plus
   `-lcorrectionlib`, so `correction.h`-dependent helpers compile and link
   without extra configuration.
@@ -319,12 +317,14 @@ mkSnapshot.py --submitBatch           # produce skimmed trees
 mkSnapshot.py --checkBatch [--resubmit]
 mkSnapshot.py --haddBatch             # merge with haddnano.py
 mkSnapshot.py --patch                 # top up an incomplete snapshot set
-mkShapes.py --fromSnapshot --submitBatch   # fill histograms from snapshots
 ```
 
-`mkShapes.py --fromSnapshot` routes through `makeFromSnapshot()`, which reads
-the snapshot trees instead of nanoAOD. `SnapshotMetadata` records what exists so
-`--patch` can regenerate only what is missing.
+`SnapshotMetadata` records what exists so `--patch` can regenerate only what is
+missing.
+
+> **Note:** producing the snapshots is all this framework does with them. There
+> is no shape-production path that reads them back — filling histograms from a
+> snapshot instead of from nanoAOD lives outside this repository for now.
 
 ### Shape nuisances in a snapshot
 
@@ -367,8 +367,8 @@ identifier 'Lepton_pt'`. So the job attaches the friend, then redefines every
 nominal column the friend provides, walking the friend's branch list on the
 node because which columns those are belongs to the input files, not to the
 configuration. Everything downstream sees varied values under the **nominal**
-names, which is what lets `mkShapes --fromSnapshot` take the varied file as a
-friend and read `<nuisance><Up|Down>.<nominal column>` from it. A varied job
+names, which is what lets a reader take the varied file as a friend of the
+nominal one and read `<nuisance><Up|Down>.<nominal column>` from it. A varied job
 also runs single-thread: the chain and its friend have to stay aligned entry by
 entry, and the node gives one CPU anyway.
 
@@ -410,7 +410,8 @@ that reordering; `SnapshotFactory._nuisance_names()` and
 The varied files are deliberately *not* merged by `--haddBatch`:
 `selectOutputFiles` requires what follows `<sample>_<subname>_` to be the
 integer job index alone, so `..._0_JERUp.root` is reported as an orphan and
-skipped. They are inputs for `--fromSnapshot`, not chunks of the nominal tree.
+skipped. They are variation inputs in their own right, not chunks of the
+nominal tree.
 
 ---
 
