@@ -608,7 +608,7 @@ class AnalysisFactory:
         define_input_files_logic += f'    \n'
 
         # mkShapes needs getBranchNames for suffix nuisances; mkSnapshot doesn't
-        define_input_files_logic += self._build_cpp_input_files_extra(file_path, sampleName)
+        define_input_files_logic += self._build_cpp_input_files_extra(tree_name, file_path, sampleName)
 
         define_input_files_logic += f'    ROOT::RDataFrame base_df(*nominal);\n'
         define_input_files_logic += f'    auto varied_df = ROOT::RDF::RNode(base_df);\n'
@@ -724,7 +724,7 @@ class AnalysisFactory:
         }
 
     # These are overridden by mkShapes (nuisances); mkSnapshot returns ""
-    def _build_cpp_input_files_extra(self, file_path, sampleName):
+    def _build_cpp_input_files_extra(self, tree_name, file_path, sampleName):
         return ""
 
     def _build_cpp_variations_alt_trees(self, sampleName, file_path, weight):

@@ -158,7 +158,7 @@ std::vector<std::string> getBranchNames(TTree* tree) {
     #  nuisances — mkShapes-specific overrides
     # _____________________________________________________________________________
 
-    def _build_cpp_input_files_extra(self, file_path, sampleName, tree_name="Events"):
+    def _build_cpp_input_files_extra(self, tree_name, file_path, sampleName):
         """Add friend trees for suffix nuisances + getBranchNames calls."""
         out = "    auto nominalBranches = getBranchNames(nominal);\n\n"
         out += "//  Variations input files (if any)\n"
@@ -167,9 +167,8 @@ std::vector<std::string> getBranchNames(TTree* tree) {
             if (sampleName in nuisance['samples'] and nuisance['type'] == 'shape'
                     and nuisance.get('kind') == 'suffix'):
                 mUp, mDo = nuisance['mapUp'], nuisance['mapDown']
-                #print('---', mUp, mDo) ### mcortino debug
-                out += f'    auto* friend_{mUp} = new TChain("{tree_name}");\n' ### mcortino: {self._treeName} --> {tree_name}
-                out += f'    auto* friend_{mDo} = new TChain("{tree_name}");\n' ### mcortino: {self._treeName} --> {tree_name}
+                out += f'    auto* friend_{mUp} = new TChain("{tree_name}");\n'
+                out += f'    auto* friend_{mDo} = new TChain("{tree_name}");\n'
                 for file_name in file_path:
                     fname = file_name[file_name.rfind("/")+1:]
                     out += f'    friend_{mUp}->Add("{nuisance["folderUp"]}/{fname}");\n'
