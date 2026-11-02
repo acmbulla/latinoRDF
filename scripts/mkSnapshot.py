@@ -234,8 +234,6 @@ ROOT::RDF::RNode SafeDefine(ROOT::RDF::RNode df, std::string name, std::string e
 int main() {{
     {mt_setting}
 
-    {frags['lines_to_process']}
-
     {frags['define_input_files_logic']}
 
     {frags['define_aliases']}

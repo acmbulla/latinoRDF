@@ -162,7 +162,6 @@ non-integer `era`, and an `era` outside `1..len(split)` are all rejected.
 | `external` | Path to a `.cc`/`.cpp`/`.h` file; its contents are spliced in verbatim, **deduplicated by path** | before `main()` |
 | `linesToAdd` | Literal lines (typically `#include`), deduplicated | top of file, before `external` content |
 | `linesToGlobal` | Literal lines at global scope, deduplicated — **the place for global object instances** | before `main()`, *after* `external` content |
-| `linesToProcess` | Literal lines emitted inside `main()`, **not** deduplicated | first statements in `main()` |
 | `function` + `variables` | Call a C++ functor over the listed columns | `.Define(...)` chain |
 | `xmlfile` + `variables` | TMVA `RReader` model evaluation | `.Define(...)` chain |
 
@@ -546,6 +545,11 @@ print(b.GetLeaf("Jet_hadronFlavour").GetTypeName())
 ```
 
 ### Forbidden patterns
+
+The pattern this replaced, kept here so it is recognisable in an old
+configuration. `linesToProcess` was the alias key that emitted literal lines
+inside `main()`, and it existed for nothing else; it has since been removed,
+so these no longer run — they are silently ignored.
 
 ```python
 'linesToAdd'    : ['#include "TInterpreter.h"'],
