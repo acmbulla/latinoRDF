@@ -588,7 +588,7 @@ class AnalysisFactory:
                           aliases_ordered, range_start=None, range_end=None):
         """
         Returns a dict of C++ fragments shared between mkShapes and mkSnapshot:
-          code_of_function_to_include, lines_to_add, lines_to_global, lines_to_process,
+          code_of_function_to_include, lines_to_add, lines_to_global,
           define_input_files_logic, define_aliases (all in order), define_weights,
           booking_logic, define_variables_and_cuts_logic
         """
@@ -618,7 +618,6 @@ class AnalysisFactory:
         code_of_function_to_include = ""
         _included_external_files    = set()
         lines_to_add     = ""
-        lines_to_process = ""
         lines_to_global  = ""
         _included_lines_to_add    = set()
         _included_lines_to_global = set()
@@ -638,10 +637,6 @@ class AnalysisFactory:
                             lines_to_add += line + "\n"
                             _included_lines_to_add.add(line)
 
-                if 'linesToProcess' in alias:
-                    for line in alias['linesToProcess']:
-                        lines_to_process += "    " + line + "\n"
-
                 if 'linesToGlobal' in alias:
                     for line in alias['linesToGlobal']:
                         if line not in _included_lines_to_global:
@@ -655,7 +650,7 @@ class AnalysisFactory:
                         code_of_function_to_include += "\n"
                         _included_external_files.add(alias["external"])
 
-                if (('linesToAdd' in alias or 'linesToGlobal' in alias or 'linesToProcess' in alias) and 'expr' in alias):
+                if (('linesToAdd' in alias or 'linesToGlobal' in alias) and 'expr' in alias):
                     _expr = alias['expr'].replace("'", '\\"')
                     define_aliases += f'    varied_df = SafeDefine(varied_df, "{aliasName}", "{_expr}");\n'
                     continue
@@ -714,7 +709,6 @@ class AnalysisFactory:
             'code_for_special_nuisances'     : code_for_special_nuisances,
             'lines_to_add'                   : lines_to_add,
             'lines_to_global'                : lines_to_global,
-            'lines_to_process'               : lines_to_process,
             'define_input_files_logic'       : define_input_files_logic,
             'define_aliases'                 : define_aliases,
             'define_weights'                 : define_weights,

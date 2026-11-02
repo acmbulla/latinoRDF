@@ -402,8 +402,6 @@ std::vector<std::string> getBranchNames(TTree* tree) {
 int main() {{
     ROOT::DisableImplicitMT();
 
-    {frags['lines_to_process']}
-
     {frags['define_input_files_logic']}
 
     std::map<std::string, std::vector<ROOT::RDF::RResultPtr<TH1D>>> hist_map_1D;

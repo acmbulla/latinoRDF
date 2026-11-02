@@ -465,8 +465,6 @@ std::vector<std::string> getBranchNames(TTree* tree) {{
 int main() {{
     {mt_setting}
 
-    {frags['lines_to_process']}
-
     {frags['define_input_files_logic']}
 
     {frags['define_aliases']}
