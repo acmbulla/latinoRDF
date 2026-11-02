@@ -15,6 +15,14 @@ import ROOT
 # directory where analysisFactory.py (and haddfast.py, haddnano.py) live
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Variation tags. They become the suffix of every varied histogram name
+# (histo_<sample>_<nuisance><Up|Down>) and have to match what combine expects
+# for $SYSTEMATIC. Defined here, once, because mkShapes writes them while
+# mkPlot, mkDatacards and mkMergeYears read them back: when the four disagree
+# the producers and the consumers simply stop finding each other's histograms,
+# with no error.
+TAG_UP, TAG_DOWN = 'Up', 'Down'
+
 
 def _base_ns():
     """Base namespace for exec — injects builtins + common modules used in config files."""
@@ -138,7 +146,7 @@ class AnalysisFactory:
       - cuts / categories
       - MaxEventsPerJob / FilesPerJob chunking with parallel event counting + JSON cache
       - split / era event slicing across eras via RDataFrame Range()
-      - submitBatch (optional proxy, precompiled vs compile-on-node, single .sub file)
+      - submitBatch (optional proxy, per-job precompiled vs compile-on-node, one .sub)
       - checkBatch + --resubmit
       - parallelCompile
 
@@ -588,7 +596,7 @@ class AnalysisFactory:
                           aliases_ordered, range_start=None, range_end=None):
         """
         Returns a dict of C++ fragments shared between mkShapes and mkSnapshot:
-          code_of_function_to_include, lines_to_add, lines_to_global, lines_to_process,
+          code_of_function_to_include, lines_to_add, lines_to_global,
           define_input_files_logic, define_aliases (all in order), define_weights,
           booking_logic, define_variables_and_cuts_logic
         """
@@ -599,11 +607,16 @@ class AnalysisFactory:
             define_input_files_logic += f'    nominal->Add("{file_name}");\n'
         define_input_files_logic += f'    \n'
 
-        # mkShapes needs getBranchNames for suffix nuisances; mkSnapshot doesn't
-        define_input_files_logic += self._build_cpp_input_files_extra(file_path, sampleName)
+        # both producers attach friend trees here: mkShapes the suffix folders of
+        # every nuisance, mkSnapshot the one folder of the variation it is running
+        define_input_files_logic += self._build_cpp_input_files_extra(tree_name, file_path, sampleName)
 
         define_input_files_logic += f'    ROOT::RDataFrame base_df(*nominal);\n'
         define_input_files_logic += f'    auto varied_df = ROOT::RDF::RNode(base_df);\n'
+
+        # hook for whatever has to act on varied_df before the aliases are
+        # defined -- mkSnapshot replaces the varied columns there
+        define_input_files_logic += self._build_cpp_after_df(sampleName)
 
         # ---- weights ----
         define_weights = f"//  weights needed\n"
@@ -613,7 +626,6 @@ class AnalysisFactory:
         code_of_function_to_include = ""
         _included_external_files    = set()
         lines_to_add     = ""
-        lines_to_process = ""
         lines_to_global  = ""
         _included_lines_to_add    = set()
         _included_lines_to_global = set()
@@ -633,10 +645,6 @@ class AnalysisFactory:
                             lines_to_add += line + "\n"
                             _included_lines_to_add.add(line)
 
-                if 'linesToProcess' in alias:
-                    for line in alias['linesToProcess']:
-                        lines_to_process += "    " + line + "\n"
-
                 if 'linesToGlobal' in alias:
                     for line in alias['linesToGlobal']:
                         if line not in _included_lines_to_global:
@@ -650,7 +658,7 @@ class AnalysisFactory:
                         code_of_function_to_include += "\n"
                         _included_external_files.add(alias["external"])
 
-                if (('linesToAdd' in alias or 'linesToGlobal' in alias or 'linesToProcess' in alias) and 'expr' in alias):
+                if (('linesToAdd' in alias or 'linesToGlobal' in alias) and 'expr' in alias):
                     _expr = alias['expr'].replace("'", '\\"')
                     define_aliases += f'    varied_df = SafeDefine(varied_df, "{aliasName}", "{_expr}");\n'
                     continue
@@ -709,7 +717,6 @@ class AnalysisFactory:
             'code_for_special_nuisances'     : code_for_special_nuisances,
             'lines_to_add'                   : lines_to_add,
             'lines_to_global'                : lines_to_global,
-            'lines_to_process'               : lines_to_process,
             'define_input_files_logic'       : define_input_files_logic,
             'define_aliases'                 : define_aliases,
             'define_weights'                 : define_weights,
@@ -722,7 +729,10 @@ class AnalysisFactory:
         }
 
     # These are overridden by mkShapes (nuisances); mkSnapshot returns ""
-    def _build_cpp_input_files_extra(self, file_path, sampleName):
+    def _build_cpp_input_files_extra(self, tree_name, file_path, sampleName):
+        return ""
+
+    def _build_cpp_after_df(self, sampleName):
         return ""
 
     def _build_cpp_variations_alt_trees(self, sampleName, file_path, weight):
@@ -763,6 +773,27 @@ class AnalysisFactory:
         return f"cp {src} {dest_dir}/"
 
     @staticmethod
+    def _write_if_changed(path, content):
+        """Write content to path only when it differs from what is there.
+
+        The generation step runs again before every compile and every submit,
+        so without this every .cpp would get a fresh mtime each time and the
+        binary next to it would always look stale. submitBatch compares the two
+        mtimes to decide whether to ship the binary or recompile on the node,
+        and that comparison is only meaningful if an unchanged file is left
+        alone.
+        """
+        try:
+            with open(path, 'r') as fh:
+                if fh.read() == content:
+                    return False
+        except OSError:
+            pass
+        with open(path, 'w') as fh:
+            fh.write(content)
+        return True
+
+    @staticmethod
     def _clean_transfer_list(files_str):
         """Drop the empty entries of a comma-separated transfer_input_files list.
 
@@ -771,7 +802,8 @@ class AnalysisFactory:
         """
         return ", ".join(f.strip() for f in files_str.split(',') if f.strip())
 
-    def _check_proxy(self):
+    @staticmethod
+    def _check_proxy():
         """Locate an X509 proxy. Returns ("", lines) when there is none.
 
         A proxy is *not* required to reach CERN EOS: xrdcp to eosuser/eoscms
@@ -815,6 +847,90 @@ class AnalysisFactory:
         print("           will fail on the node: voms-proxy-init --voms cms --valid 168:00")
         return "", (f"export EOS_MGM_URL=root://eosuser.cern.ch\n")
 
+    @staticmethod
+    def _check_kerberos():
+        """Locate a Kerberos credential cache. Returns ("", "") when there is none.
+
+        Why this is shipped rather than read from /tmp on the node: the
+        execute node is a different machine, and its /tmp is not the submit
+        node's. A job that reads /tmp/krb5cc_<uid> there finds either nothing
+        or, on a shared pool, somebody else's file. So the cache travels in
+        transfer_input_files like the proxy does, and the wrapper points
+        KRB5CCNAME at the sandbox copy.
+
+        That export is not cosmetic. The submit file sets `getenv = True`, so
+        the job inherits KRB5CCNAME from the submitting shell -- a path that
+        does not exist on the node. Without the export, shipping the cache
+        would change nothing.
+
+        Only a FILE cache can be copied. A KEYRING, KCM, DIR or MEMORY cache
+        lives in the kernel or in a daemon and has no file to transfer; that is
+        reported with the way out, and submission continues.
+
+        A ticket is good for about ten hours. Jobs that start after that -- a
+        long queue, or a resubmission the next day -- find it expired and fail
+        their EOS copy, which is why `MY.SendCredential = True` with a
+        credential stored on the schedd is the robust answer for a long
+        campaign. This is the cheap one.
+        """
+        ccname = os.environ.get('KRB5CCNAME', '')
+        if ':' in ccname and not ccname.startswith('FILE:'):
+            kind = ccname.split(':', 1)[0]
+            print(f"  WARNING: KRB5CCNAME is a {kind} cache, which has no file to ship.")
+            print( "           For a copyable one, before submitting:")
+            print( "             kinit -c FILE:/tmp/krb5cc_$(id -u)")
+            print( "             export KRB5CCNAME=FILE:/tmp/krb5cc_$(id -u)")
+            return "", ""
+
+        candidates = [
+            ccname[len('FILE:'):] if ccname.startswith('FILE:') else ccname,
+            f"/tmp/krb5cc_{os.getuid()}",
+        ]
+        cache = next((c for c in candidates if c and os.path.isfile(c)), None)
+        if not cache:
+            print("  -> No Kerberos credential cache found; submitting without one.")
+            return "", ""
+
+        valid = True
+        try:
+            valid = subprocess.run(["klist", "-s", "-c", f"FILE:{cache}"],
+                                   capture_output=True).returncode == 0
+        except FileNotFoundError:
+            print("  -> klist not found, not checking the ticket validity.")
+
+        if not valid:
+            print(f"  WARNING: Kerberos cache {cache} holds no valid ticket.")
+            print( "           Submitting without it: kinit, then resubmit, if the")
+            print( "           job writes to EOS over Kerberos rather than with a proxy.")
+            return "", ""
+
+        basename = os.path.basename(cache)
+        print(f"  -> Kerberos ticket found and valid: {cache}")
+        print( "     Shipped with the job. It expires in hours, not days, so a job")
+        print( "     that starts much later will not have it.")
+        return cache, (f"export KRB5CCNAME=FILE:$(pwd)/{basename}\n"
+                       f"chmod 600 $(pwd)/{basename} 2>/dev/null || true\n"
+                       f"klist 2>/dev/null || true\n")
+
+    @staticmethod
+    def _check_credentials():
+        """The credential files to ship, and the lines that point the job at them.
+
+        Both are optional and independent: a grid proxy, a Kerberos ticket,
+        either, or neither. Whatever is there is shipped, nothing is required,
+        and the job fails later with xrootd's own message if it needed what was
+        missing.
+
+        A staticmethod because mkMergeYears submits from a module-level
+        function rather than from an AnalysisFactory, and needs the same
+        credentials for the same reason: its jobs xrdcp each year's file off
+        EOS.
+        """
+        x509_proxy, proxy_lines = AnalysisFactory._check_proxy()
+        krb_cache,  krb_lines   = AnalysisFactory._check_kerberos()
+        credentials = ", ".join(p for p in (x509_proxy, krb_cache) if p)
+        return credentials, krb_lines + proxy_lines
+
     # _____________________________________________________________________________
     #  submitBatch — shared skeleton
     # _____________________________________________________________________________
@@ -835,14 +951,13 @@ class AnalysisFactory:
 
         self._prepare_submit_batch(root_cflags, root_libs)
 
-        precompiled = self._detect_precompiled()
-        print(f"  -> {'Pre-compiled' if precompiled else 'Compile-on-node'} mode.")
-
-        x509_proxy, proxy_lines = self._check_proxy()
+        credentials, proxy_lines = self._check_credentials()
 
         self._pre_count_events()
 
-        queue_rows = []
+        queue_rows  = []
+        missing_src = []
+        n_precompiled = 0
 
         for sampleName, sample in self._samples.items():
             os.makedirs(os.path.join(self._script_batch_location, sampleName), exist_ok=True)
@@ -855,24 +970,44 @@ class AnalysisFactory:
                 chunks = self._get_chunks(sample, list_root_files)
 
                 for i, chunk in enumerate(chunks):
-                    job_name   = self.job_prefix() + "_" + sampleName + "_" + subname + "_" + str(i)
+                  for job_name, out_file in self._batch_jobs_for_chunk(sampleName, subname, i):
                     name_bash  = os.path.join(self._script_batch_location, sampleName, subname, job_name + ".sh")
-                    out_file   = self.output_file_name(sampleName, subname, i)
                     name_folder      = os.path.join(self._script_batch_location, sampleName, subname)
                     name_folder_code = os.path.join(self._scripts_run_folder, sampleName, subname)
                     abs_executable   = os.path.join(name_folder_code, job_name)
                     abs_cpp          = os.path.join(name_folder_code, job_name + ".cpp")
 
-                    if precompiled:
+                    # Per job, not once for the whole submission. The mode used
+                    # to be decided by probing a single nominal executable, so
+                    # compiling the nominal binaries and not the shape-nuisance
+                    # ones put every job in pre-compiled mode and condor refused
+                    # the cluster over a binary that was never built. Shipping
+                    # the .cpp of whatever is not compiled yet is always safe:
+                    # the node compiles it in a minute or two.
+                    # A binary older than its .cpp was built from a source
+                    # the generation step has since rewritten, i.e. from an
+                    # older configuration. Recompiling on the node costs a
+                    # minute; shipping it silently produces wrong histograms.
+                    usable_exe = (os.path.isfile(abs_executable)
+                                  and (not os.path.isfile(abs_cpp)
+                                       or os.path.getmtime(abs_executable)
+                                          >= os.path.getmtime(abs_cpp)))
+                    if usable_exe:
                         bash_code = self._build_bash_precompiled(
                             job_name, out_file, sampleName, subname, proxy_lines,
                             submission_dir, root_cflags, root_libs)
                         job_exe = abs_executable
+                        n_precompiled += 1
                     else:
                         bash_code = self._build_bash_compile_on_node(
                             job_name, out_file, sampleName, subname, proxy_lines,
                             submission_dir, root_cflags, root_libs)
                         job_exe = abs_cpp
+                        if not os.path.isfile(abs_cpp):
+                            # neither a binary nor a source: the scripts were
+                            # never generated. transfer_input_files names
+                            # job_exe, so condor would refuse the cluster.
+                            missing_src.append(abs_cpp)
 
                     with open(name_bash, "w") as f:
                         f.write(bash_code)
@@ -888,12 +1023,29 @@ class AnalysisFactory:
 
                     queue_rows.append((name_bash, job_exe, output_file, error_file, log_file))
 
+        n_on_node = len(queue_rows) - n_precompiled
+        print(f"  -> {n_precompiled} pre-compiled job(s), {n_on_node} compiling on the node.")
+
+        if missing_src:
+            print(f"  ERROR: {len(missing_src)} job(s) have neither a binary nor a .cpp:")
+            for f in missing_src[:10]:
+                print(f"       {f}")
+            if len(missing_src) > 10:
+                print(f"       ... and {len(missing_src) - 10} more")
+            print("         Generate the scripts first; condor would refuse the")
+            print("         whole cluster over the missing transfer_input_files.")
+            return
+
         # single .sub file
         global_submit_path = os.path.join(self._script_batch_location, "submit_all.sub")
         extra_files     = self._extra_transfer_files
         extra_files_str = (", " + ", ".join(extra_files)) if extra_files else ""
+        # transfer_input_files is one line for every job in the cluster, so when
+        # any job compiles on the node the list has to carry what that needs.
+        # The extra entries are two small files and are ignored by a job that
+        # does not compile.
         fixed_extra = self._clean_transfer_list(
-            self._extra_transfer_files_for_submit(precompiled, x509_proxy, extra_files_str))
+            self._extra_transfer_files_for_submit(n_on_node == 0, credentials, extra_files_str))
 
         queue_lines = "\n".join(
             f"  {exe}, {job_exe}, {out}, {err}, {log}"
@@ -902,7 +1054,7 @@ class AnalysisFactory:
 
         submit_code = (
             f"# Auto-generated by {self.__class__.__name__}\n"
-            f"# Mode: {'pre-compiled' if precompiled else 'compile-on-node'}\n\n"
+            f"# {n_precompiled} pre-compiled, {n_on_node} compile-on-node\n\n"
             "should_transfer_files   = YES\n"
             "when_to_transfer_output = ON_EXIT\n"
             "transfer_output_files   = \n"
@@ -925,14 +1077,17 @@ class AnalysisFactory:
     def _prepare_submit_batch(self, root_cflags, root_libs):
         pass
 
-    def _detect_precompiled(self):
-        for sampleName, sample in self._samples.items():
-            for subname, list_root_files in self._normalize_sample_name(sample['name']).items():
-                if list_root_files:
-                    exe = os.path.join(self._scripts_run_folder, sampleName, subname,
-                                       self.job_prefix() + "_" + sampleName + "_" + subname + "_0")
-                    return os.path.isfile(exe)
-        return False
+    def _batch_jobs_for_chunk(self, sampleName, subname, i):
+        """The (job_name, out_file) pairs this chunk has to submit.
+
+        One, normally. mkSnapshot overrides it to add the shape-nuisance
+        variants: their job names carry the nuisance and the direction, so they
+        cannot be derived from job_prefix() the way the nominal one can, and
+        before this hook existed submitBatch simply never built them -- the
+        .cpp were generated by --shapeNuisances and then nothing submitted them.
+        """
+        return [(self.job_prefix() + "_" + sampleName + "_" + subname + "_" + str(i),
+                 self.output_file_name(sampleName, subname, i))]
 
     # Abstract — subclass must implement
     def job_prefix(self):
@@ -941,7 +1096,7 @@ class AnalysisFactory:
     def output_file_name(self, sampleName, subname, i):
         raise NotImplementedError
 
-    def _extra_transfer_files_for_submit(self, precompiled, x509_proxy, extra_files_str):
+    def _extra_transfer_files_for_submit(self, precompiled, credentials, extra_files_str):
         raise NotImplementedError
 
     def _build_bash_precompiled(self, job_name, out_file, sampleName, subname,
@@ -1166,7 +1321,7 @@ class AnalysisFactory:
             return
         print(f"  -> All jobs done, proceeding with hadd ({len(missing)} missing = 0)")
 
-        x509_proxy, proxy_lines = self._check_proxy()
+        credentials, proxy_lines = self._check_credentials()
 
         # resolve absolute output_dir
         if not os.path.isabs(output_dir):
@@ -1174,7 +1329,6 @@ class AnalysisFactory:
         output_dir = os.path.realpath(output_dir)   # <-- NEW: follow AFS -> EOS symlink ### mcortino
         output_dir_normalized = _re.sub(r'^/eos/home-([a-z])/',
                                          lambda m: f"/eos/user/{m.group(1)}/", output_dir)
-
 
         # driven by samples.py, never by whatever is in output_dir. Files from
         # a previous configuration carry the same histogram folder and
@@ -1236,7 +1390,7 @@ echo "Done at $(date)"; ls -lh
         os.system(f"chmod +x {hadd_sh_path}")
 
         transfer_files = self._clean_transfer_list(
-            f"{hadd_tool_transfer}, {x509_proxy}" if hadd_tool_transfer else x509_proxy)
+            f"{hadd_tool_transfer}, {credentials}" if hadd_tool_transfer else credentials)
 
         hadd_sub = f"""# hadd job for {tag}
 executable              = {hadd_sh_path}

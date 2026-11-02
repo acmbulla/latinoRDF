@@ -16,9 +16,9 @@ source setup.sh
 
 | Path | Contents |
 |---|---|
-| `scripts/` | The executable framework: `mkShapes.py`, `mkSnapshot.py`, `analysisFactory.py`, `mkPlot.py`, `mkDatacards.py`, `mkMergeYears.py`, `haddfast.py`, `haddnano.py`, `easyDescription.py` |
+| `scripts/` | The executable framework: `mkShapes.py`, `mkSnapshot.py`, `analysisFactory.py`, `mkPlot.py`, `mkDatacards.py`, `mkMergeYears.py`, `haddfast.py`, `haddnano.py`, `easyDescription.py`, `checkSuffixFriends.py` |
 | `lib/` | Plot styling helpers (`tdrStyle.py`, `CMS_lumi.py`) and `search_files.py` |
-| `plotsConfigurationsRDF/` | **Separate git repository** (`acmbulla/plotsConfigurationsRDF`), checked out as a *sibling* of this one (`<parent>/latinoRDF` and `<parent>/plotsConfigurationsRDF`). Holds the per-analysis, per-year configuration files. |
+| `plotsConfigurationsRDF/` | **Separate git repository** (`acmbulla/plotsConfigurationsRDF`), ignored by this repo via `.gitignore:209`. Holds the per-analysis, per-year configuration files. |
 
 > **Important:** `plotsConfigurationsRDF/` is a *different repo*. Changes to
 > analysis configs (including the `gInterpreter` removal, see §7) are committed
@@ -26,11 +26,17 @@ source setup.sh
 
 ### Searching the tree
 
-The configurations are not under this tree, so `grep -r <pattern> .` from the
-repo root never finds them. Search `../plotsConfigurationsRDF` explicitly, or
-`git grep` from inside that repo. If you instead keep the checkout *inside*
-latinoRDF, remember it is untracked here and will be picked up by a careless
-`git add -A`.
+The configured shell wraps `grep` with `--ignore-files`, which honours
+`.gitignore`. Because `plotsConfigurationsRDF/` is gitignored, a plain
+`grep -r <pattern> .` from the repo root **silently finds nothing there**.
+Use `command grep -r ...` (or `git grep` inside the nested repo) when searching
+configuration files.
+
+Upstream documents this checkout as a *sibling* of latinoRDF
+(`<parent>/latinoRDF` and `<parent>/plotsConfigurationsRDF`) and dropped the
+`.gitignore` entry accordingly. Ours is nested and the entry is kept, which is
+what stops a careless `git add -A` from swallowing the configuration repo. If
+you ever move to the sibling layout, that line becomes dead rather than wrong.
 
 ---
 
@@ -61,18 +67,20 @@ Subclasses must implement `job_prefix()`, `output_file_name()`, `makeScripts()`,
 
 ### `mkShapes.py` — histogram production (`ShapeFactory`)
 Generates and runs the C++ that fills histograms for every
-sample × cut × variable × nuisance. Reads nanoAOD directly.
+sample × cut × variable × nuisance. Reads nanoAOD directly, or existing
+snapshots via `makeFromSnapshot()` (`--fromSnapshot`).
 
-Options: `--parallelCompile`, `--localCompile`,
+Options: `--parallelCompile`, `--localCompile`, `--fromSnapshot`,
 `--submitBatch`, `--hadd`, `--haddBatch`, `--checkBatch`, `--resubmit`,
 `--silentMode`.
 
 ### `mkSnapshot.py` — skimmed-tree production (`SnapshotFactory`)
 Writes reduced nanoAOD-style trees (snapshots) so later shape production can
-skip the expensive full-nanoAOD pass.
+skip the expensive full-nanoAOD pass. Tracks what was produced via
+`SnapshotMetadata`, and supports `--patch` to top up an incomplete snapshot set.
 
 Options: `--localCompile`, `--submitBatch`, `--checkBatch`, `--resubmit`,
-`--silentMode`, `--haddBatch`, `--shapeNuisances`.
+`--silentMode`, `--haddBatch`, `--patch`, `--shapeNuisances`, `--force`.
 
 ### `mkMergeYears.py`
 Merges per-year shape files into a combined multi-year result, handling
@@ -162,7 +170,6 @@ non-integer `era`, and an `era` outside `1..len(split)` are all rejected.
 | `external` | Path to a `.cc`/`.cpp`/`.h` file; its contents are spliced in verbatim, **deduplicated by path** | before `main()` |
 | `linesToAdd` | Literal lines (typically `#include`), deduplicated | top of file, before `external` content |
 | `linesToGlobal` | Literal lines at global scope, deduplicated — **the place for global object instances** | before `main()`, *after* `external` content |
-| `linesToProcess` | Literal lines emitted inside `main()`, **not** deduplicated | first statements in `main()` |
 | `function` + `variables` | Call a C++ functor over the listed columns | `.Define(...)` chain |
 | `xmlfile` + `variables` | TMVA `RReader` model evaluation | `.Define(...)` chain |
 
@@ -194,8 +201,21 @@ Notes:
   `condor_submit` with `cwd=script_batch_location`.
 - Batch script names are derived from the generated `.cpp` filename (not the
   legacy generic `my_script_*`), so jobs are identifiable in the queue.
-- Two compilation modes are detected automatically: **pre-compiled** (binary
-  shipped to the node) and **compile-on-node**.
+- **The generation step is not a separate invocation.** `--submitBatch`,
+  `--localCompile` and `--parallelCompile` all run it first, so
+  `mkShapes.py --submitBatch` on an empty job directory works. Only
+  `--checkBatch` and the hadd steps skip it, because they read what is already
+  on disk. The `.cpp` are written through `_write_if_changed`, so regenerating
+  is cheap and leaves an unchanged file's mtime alone.
+- The two compilation modes are chosen **per job**: a job ships its binary if
+  that binary exists *and is newer than its `.cpp`*, otherwise it ships the
+  `.cpp` and compiles on the node (a minute or two). So nothing has to be
+  compiled before submitting, a partially built set is fine, and a binary left
+  over from an older configuration is recompiled instead of being shipped
+  silently. `submitBatch` prints the tally and aborts only when a job has
+  neither, which means its scripts were never generated.
+  `transfer_input_files` is one line for the whole cluster, so when any job
+  compiles on the node the list carries what that needs.
 - EOS copies use `xrdcp -f`; the job creates its output directory with
   `mkdir -p` before the executable runs.
 - **The X509 proxy is optional.** `submitBatch` looks for one
@@ -205,8 +225,37 @@ Notes:
   Kerberos too, so a user with EOS access and no grid certificate can submit.
   A proxy *is* needed to read inputs through a CMS redirector
   (`root://xrootd-cms...`, `cms-xrd-global`), which only accepts GSI — without
-  one those jobs fail on the node with an xrootd authentication error. Relying
-  on Kerberos also means the job needs the credential forwarded
+  one those jobs fail on the node with an xrootd authentication error.
+- **The Kerberos ticket is shipped the same way, and is just as optional.**
+  `submitBatch` and the hadd submit look for a credential cache
+  (`$KRB5CCNAME`, `/tmp/krb5cc_<uid>`), check it with `klist -s`, add it to
+  `transfer_input_files` and have the wrapper
+  `export KRB5CCNAME=FILE:$(pwd)/<basename>`. Nothing is required: proxy,
+  ticket, either, or neither, and the job fails later with xrootd's own
+  message if it needed what was missing. `_check_credentials()` is the one
+  place both are assembled, and it is a `staticmethod` so that
+  `mkMergeYears.submitBatch` — a module-level function, not an
+  `AnalysisFactory` — ships the same credentials. Its jobs `xrdcp` every
+  year's file off EOS, so they need them for exactly the same reason.
+
+  Three things about it:
+
+  - **it has to be `transfer_input_files`, not a copy from `/tmp` in the job
+    script.** The execute node is a different machine and its `/tmp` is not
+    the submit node's, so reading `/tmp/krb5cc_<uid>` there finds nothing —
+    or, on a shared pool, somebody else's file.
+  - **the export is what makes it work.** The submit file sets
+    `getenv = True`, so the job inherits `KRB5CCNAME` pointing at the submit
+    node's path. Without pointing it at the sandbox copy, shipping the cache
+    changes nothing.
+  - **only a FILE cache can be copied.** A `KEYRING`, `KCM`, `DIR` or
+    `MEMORY` cache lives in the kernel or in a daemon and has no file to
+    transfer; that is reported, with `kinit -c FILE:/tmp/krb5cc_$(id -u)` as
+    the way out, and submission continues.
+
+  A ticket is good for about ten hours, so a long queue or a resubmission the
+  next day finds it expired. For a campaign that outlives it, the robust
+  answer is still the credential forwarding this does not use
   (`MY.SendCredential = True` in the submit file, with a credential stored on
   the schedd); that is not set by default.
 - `--haddBatch` uses `haddfast.py` for shapes and `haddnano.py` for snapshots.
@@ -224,8 +273,9 @@ Notes:
   `os.listdir`. Anything left over is listed and skipped, never merged. See
   "Stale per-job files" below for why this is not a convenience.
 - For snapshots the merged file is `snapshot_<tag>.root`, deliberately *not*
-  matching the per-job pattern `nanoLatino_snapshot____*.root`, so anything
-  globbing the parts cannot pick up the merged file alongside them.
+  matching `nanoLatino_snapshot____*.root`, since `makeFromSnapshot` globs that
+  pattern per sample and would otherwise read the merged file alongside its
+  own parts.
 - Compilation links ROOT (`root-config --cflags/--libs`) plus
   `-lcorrectionlib`, so `correction.h`-dependent helpers compile and link
   without extra configuration.
@@ -268,11 +318,99 @@ Two consequences worth knowing:
 mkSnapshot.py --submitBatch           # produce skimmed trees
 mkSnapshot.py --checkBatch [--resubmit]
 mkSnapshot.py --haddBatch             # merge with haddnano.py
+mkSnapshot.py --patch                 # top up an incomplete snapshot set
+mkShapes.py --fromSnapshot --submitBatch   # fill histograms from snapshots
 ```
 
-`--shapeNuisances` generates the varied trees
-(`nanoLatino_snapshot____<sample>_<subname>_<i>_<nuisance>Up/Down.root`)
-alongside the nominal ones.
+`mkShapes.py --fromSnapshot` routes through `makeFromSnapshot()`, which reads
+the snapshot trees instead of nanoAOD. `SnapshotMetadata` records what exists so
+`--patch` can regenerate only what is missing.
+
+### Shape nuisances in a snapshot
+
+**There is no flag.** A `suffix` nuisance left uncommented in `nuisances.py` *is*
+the request, so the varied trees are part of every step by themselves:
+
+```
+mkSnapshot.py --submitBatch           # generates, then queues nominal + varied
+mkSnapshot.py --checkBatch [--resubmit]
+mkSnapshot.py --haddBatch             # nominal only, by design (see below)
+
+mkSnapshot.py --localCompile          # optional: build locally first
+mkSnapshot.py --noShapeNuisances ...  # escape hatch: nominal only
+```
+
+`--submitBatch` is enough on its own: it generates the `.cpp` (nominal and
+varied), finds no binaries and ships the sources, and the nodes compile.
+`--localCompile` only trades node time for local time.
+
+`--shapeNuisances` is still accepted and ignored, with a note. It used to be
+required on every step, which made it possible to generate the varied `.cpp`
+and then submit only the nominal jobs — a half-run with nothing to say so.
+`makeScripts()` now writes both makefiles, `--localCompile` builds both, and
+`SnapshotFactory.doShapeNuisances()` is the single predicate.
+
+Only the `suffix` / `suffixFly` nuisances need any of this — the variation is
+in the input files, so it needs its own pass. The `weight` ones do not:
+`_build_full_variables_to_dump` already adds a `my_sample_weight_<name>Up` and
+`Down` branch for each of them, so the varied weight is in the nominal tree. At
+148 nuisances that is 258 extra branches, 206 of them PDF, and it dominates the
+file size.
+
+A varied job reads the **nominal** files, with the nuisance's `folderUp` /
+`folderDown` added as a *friend* — not instead of them. A `*_suffix`
+production is not a full nanoAOD: it holds only the branches the variation
+touches, each named `<nominal branch>_<map>` (`CleanJet_pt_jesRegroed_HF_2024up`
+and so on). Read on its own it defines almost nothing, and the first alias or
+cut that mentions an ordinary branch dies in the JIT with `use of undeclared
+identifier 'Lepton_pt'`. So the job attaches the friend, then redefines every
+nominal column the friend provides, walking the friend's branch list on the
+node because which columns those are belongs to the input files, not to the
+configuration. Everything downstream sees varied values under the **nominal**
+names, which is what lets `mkShapes --fromSnapshot` take the varied file as a
+friend and read `<nuisance><Up|Down>.<nominal column>` from it. A varied job
+also runs single-thread: the chain and its friend have to stay aligned entry by
+entry, and the node gives one CPU anyway.
+
+Before submitting the varied jobs, check what the friends actually contain:
+
+```bash
+checkSuffixFriends.py --pycfg configuration.py              # missing / short friend files
+checkSuffixFriends.py --pycfg configuration.py --branches   # which columns get replaced
+```
+
+Two failure modes it exists for, both of which were real and neither of which
+announces itself:
+
+1. **A missing or shorter `_suffix` file.** The friend is positional, so a job
+   whose friend runs out of entries reads past the end and segfaults in the
+   event loop. A dataset is not guaranteed to exist in every `_suffix` folder.
+2. **A collection replaced only in part.** The job redefines the friend
+   branches whose nominal counterpart exists, and nothing more. If the friend
+   carries `nCleanJet` but not `CleanJet_jetIdx`, the counter says there are
+   more jets than the array holds, and every helper that loops over the
+   counter and indexes the arrays reads out of bounds — which is exactly how
+   `btagSFlight::operator()` died. `--branches` separates that case (`RESIZED`)
+   from the harmless one (`partial`: no varied counter, so the lengths are
+   unchanged — a JES shift moves `Jet_pt`, not `Jet_eta`).
+
+The helpers in `plotsConfigurationsRDF/SSWW/utils/macros/` now bound their
+loops by the array sizes rather than by the counter branch, so case 2 can no
+longer crash; the check still matters, because a varied value read from a
+nominal-length array is wrong rather than fatal.
+
+Naming, and why it is in one place. A varied job is
+`my_snapshot_<nuisance><Up|Down>_<sample>_<subname>_<i>` and writes
+`nanoLatino_snapshot____<sample>_<subname>_<i>_<nuisance><Up|Down>.root` — the
+nuisance leads in the job name and trails in the file name. `checkBatch` finds
+jobs by listing the `.sh` on disk and strips `job_prefix()_`, so it has to undo
+that reordering; `SnapshotFactory._nuisance_names()` and
+`_output_file_from_suffix()` are the only two places that know the layout.
+
+The varied files are deliberately *not* merged by `--haddBatch`:
+`selectOutputFiles` requires what follows `<sample>_<subname>_` to be the
+integer job index alone, so `..._0_JERUp.root` is reported as an orphan and
+skipped. They are inputs for `--fromSnapshot`, not chunks of the nominal tree.
 
 ---
 
@@ -546,6 +684,11 @@ print(b.GetLeaf("Jet_hadronFlavour").GetTypeName())
 ```
 
 ### Forbidden patterns
+
+The pattern this replaced, kept here so it is recognisable in an old
+configuration. `linesToProcess` was the alias key that emitted literal lines
+inside `main()`, and it existed for nothing else; it has since been removed
+from the framework, so these no longer run — they are silently ignored.
 
 ```python
 'linesToAdd'    : ['#include "TInterpreter.h"'],

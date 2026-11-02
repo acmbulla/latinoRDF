@@ -12,11 +12,8 @@ import ROOT
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from analysisFactory import (AnalysisFactory, defaultParser, loadDefaultOptions,
-                             read_exec, load_config_files, _SCRIPTS_DIR)
-
-# Variation tags used by RDataFrame Vary(): they end up as suffixes of the histogram names
-# and must match what combine expects ($SYSTEMATIC -> <nuisance>Up / <nuisance>Down).
-TAG_UP, TAG_DOWN = 'Up', 'Down'
+                             read_exec, load_config_files, _SCRIPTS_DIR,
+                             TAG_UP, TAG_DOWN)
 
 
 # -----------------------------------------------------------------------
@@ -161,7 +158,7 @@ std::vector<std::string> getBranchNames(TTree* tree) {
     #  nuisances — mkShapes-specific overrides
     # _____________________________________________________________________________
 
-    def _build_cpp_input_files_extra(self, file_path, sampleName, tree_name="Events"):
+    def _build_cpp_input_files_extra(self, tree_name, file_path, sampleName):
         """Add friend trees for suffix nuisances + getBranchNames calls."""
         out = "    auto nominalBranches = getBranchNames(nominal);\n\n"
         out += "//  Variations input files (if any)\n"
@@ -170,9 +167,8 @@ std::vector<std::string> getBranchNames(TTree* tree) {
             if (sampleName in nuisance['samples'] and nuisance['type'] == 'shape'
                     and nuisance.get('kind') == 'suffix'):
                 mUp, mDo = nuisance['mapUp'], nuisance['mapDown']
-                #print('---', mUp, mDo) ### mcortino debug
-                out += f'    auto* friend_{mUp} = new TChain("{tree_name}");\n' ### mcortino: {self._treeName} --> {tree_name}
-                out += f'    auto* friend_{mDo} = new TChain("{tree_name}");\n' ### mcortino: {self._treeName} --> {tree_name}
+                out += f'    auto* friend_{mUp} = new TChain("{tree_name}");\n'
+                out += f'    auto* friend_{mDo} = new TChain("{tree_name}");\n'
                 for file_name in file_path:
                     fname = file_name[file_name.rfind("/")+1:]
                     out += f'    friend_{mUp}->Add("{nuisance["folderUp"]}/{fname}");\n'
@@ -213,14 +209,21 @@ std::vector<std::string> getBranchNames(TTree* tree) {
             if (sampleName in nuisance['samples'] and nuisance['type'] == 'shape'
                     and nuisance.get('kind') == 'weight'):
                 samples_entry = nuisance['samples'][sampleName]
+                # The configuration expressions are parenthesised before they
+                # are spliced into a product. Without that, a factor that is
+                # not a primary expression rebinds: a ternary such as
+                # 'v.size() > 0 ? v[0] : 1.' becomes
+                # '((w * v.size()) > 0) ? v[0] : 1.', because * binds tighter
+                # than > and > tighter than ?:, so the nominal weight is
+                # dropped and the variation is filled with the bare ratio.
                 if len(samples_entry) == 3:
                     if samples_entry[0] in weight:
-                        var_up = weight.replace(samples_entry[0], samples_entry[1])
-                        var_do = weight.replace(samples_entry[0], samples_entry[2])
+                        var_up = weight.replace(samples_entry[0], f"({samples_entry[1]})")
+                        var_do = weight.replace(samples_entry[0], f"({samples_entry[2]})")
                         out += f'    varied_df = varied_df.Vary("my_sample_weight", "ROOT::RVecD{{{var_up},{var_do}}}", {{"{TAG_UP}", "{TAG_DOWN}"}}, "{nuisance["name"]}");\n'
                 else:
-                    var_up = f"(my_sample_weight) * {samples_entry[0]}"
-                    var_do = f"(my_sample_weight) * {samples_entry[1]}"
+                    var_up = f"(my_sample_weight) * ({samples_entry[0]})"
+                    var_do = f"(my_sample_weight) * ({samples_entry[1]})"
                     out += f'    varied_df = varied_df.Vary("my_sample_weight", "ROOT::RVecD{{{var_up},{var_do}}}", {{"{TAG_UP}", "{TAG_DOWN}"}}, "{nuisance["name"]}");\n'
         return out
 
@@ -292,9 +295,9 @@ std::vector<std::string> getBranchNames(TTree* tree) {
                         if 'cut' in sub_cut_name:
                             out += f'    ROOT::RDF::RNode node_{this_cutName}___{sampleName}_{sub_name} = node_{this_cutName}.Filter("{sub_cut_name["cut"]}", "cut_{sampleName}_{sub_name}");\n'
                             if 'weight' in sub_cut_name:
-                                out += f'    node_{this_cutName}___{sampleName}_{sub_name} = SafeDefine(node_{this_cutName}___{sampleName}_{sub_name}, "my_sample_weight_{sampleName}_{sub_name}", "(my_sample_weight)*{sub_cut_name["weight"]}");\n'
+                                out += f'    node_{this_cutName}___{sampleName}_{sub_name} = SafeDefine(node_{this_cutName}___{sampleName}_{sub_name}, "my_sample_weight_{sampleName}_{sub_name}", "(my_sample_weight)*({sub_cut_name["weight"]})");\n'
                         elif 'weight' in sub_cut_name:
-                            out += f'    node_{this_cutName} = SafeDefine(node_{this_cutName}, "my_sample_weight_{sampleName}_{sub_name}", "(my_sample_weight)*{sub_cut_name["weight"]}");\n'
+                            out += f'    node_{this_cutName} = SafeDefine(node_{this_cutName}, "my_sample_weight_{sampleName}_{sub_name}", "(my_sample_weight)*({sub_cut_name["weight"]})");\n'
 
                 for variableName, variable in self._variables.items():
                     variable_range = variable['range']
@@ -395,8 +398,6 @@ std::vector<std::string> getBranchNames(TTree* tree) {
 
 int main() {{
     ROOT::DisableImplicitMT();
-
-    {frags['lines_to_process']}
 
     {frags['define_input_files_logic']}
 
@@ -539,8 +540,7 @@ int main() {{
     return 0;
 }}
 """
-        with open(f"{output_name}.cpp", "w") as f:
-            f.write(cpp_code)
+        self._write_if_changed(f"{output_name}.cpp", cpp_code)
 
     # _____________________________________________________________________________
     #  generate_makefile
@@ -969,7 +969,7 @@ int main() {{
                 register_variations += f'''    varied_df = varied_df.Vary(
       "my_sample_weight",
       "ROOT::RVecD{{{bUp},{bDo}}}",
-      {{"up", "do"}},
+      {{"{TAG_UP}", "{TAG_DOWN}"}},
       "{nuisanceName}"
     );\n'''
 
@@ -990,7 +990,7 @@ int main() {{
                 register_variations += f'          std::string expr = (col_type.find("RVec") != std::string::npos)\n'
                 register_variations += f'            ? "ROOT::RVec<" + col_type + ">{{" + upCol + ", " + downCol + "}}"\n'
                 register_variations += f'            : "ROOT::RVec<" + col_type + ">{{static_cast<" + col_type + ">(" + upCol + "), static_cast<" + col_type + ">(" + downCol + ")}}";\n'
-                register_variations += f'          varied_df = varied_df.Vary(col, expr, {{"up","do"}}, "{nuisanceName}");\n'
+                register_variations += f'          varied_df = varied_df.Vary(col, expr, {{"{TAG_UP}", "{TAG_DOWN}"}}, "{nuisanceName}");\n'
                 register_variations += f'        }}\n'
                 register_variations += f'      }}\n'
                 register_variations += f'    }}\n'
@@ -1154,8 +1154,7 @@ int main() {{
     return 0;
 }}
 """
-        with open(f"{output_name}.cpp", "w") as f:
-            f.write(cpp_code)
+        self._write_if_changed(f"{output_name}.cpp", cpp_code)
 
     # _____________________________________________________________________________
     #  haddBatch — submit a single condor job to hadd all root files
@@ -1200,10 +1199,10 @@ int main() {{
         self._abs_lib_cpp = abs_lib_cpp
         self._abs_lib_h   = os.path.join(self._scripts_run_folder, "library_utils.h")
 
-    def _extra_transfer_files_for_submit(self, precompiled, x509_proxy, extra_files_str):
+    def _extra_transfer_files_for_submit(self, precompiled, credentials, extra_files_str):
         if precompiled:
-            return f"{self._abs_library}, {x509_proxy}{extra_files_str}"
-        return f"{self._abs_lib_cpp}, {self._abs_lib_h}, {self._abs_library}, {x509_proxy}{extra_files_str}"
+            return f"{self._abs_library}, {credentials}{extra_files_str}"
+        return f"{self._abs_lib_cpp}, {self._abs_lib_h}, {self._abs_library}, {credentials}{extra_files_str}"
 
     def _build_bash_precompiled(self, job_name, out_file, sampleName, subname,
                                 proxy_lines, submission_dir, root_cflags, root_libs):
@@ -1298,10 +1297,10 @@ if __name__ == '__main__':
     )
     factory.setConditions(opt.silentMode)
 
-    if not any([opt.submitBatch, opt.haddRootFiles, opt.haddBatch, opt.checkBatch,
-                opt.localCompile, opt.parallelCompile, opt.fromSnapshot]):
-        factory.makeNominals()
-
+    # Generating the .cpp is the prerequisite of compiling and of submitting,
+    # and it is cheap and idempotent (_write_if_changed), so it runs for those
+    # too rather than being a separate bare invocation. --checkBatch and the
+    # hadd steps only read what is already on disk.
     if opt.fromSnapshot:
         snapshot_dir = getattr(opt, 'snapshotDir', None) or \
                        getattr(opt, 'folder_where_to_save_trees', None) or \
@@ -1310,6 +1309,8 @@ if __name__ == '__main__':
         files_per_job   = int(getattr(opt, 'snapshotFilesPerJob', 50))
         print(f"fromSnapshot: reading from {snapshot_dir}, {files_per_job} files/job")
         factory.makeFromSnapshot(snapshot_dir, files_per_job=files_per_job)
+    elif not any([opt.haddRootFiles, opt.haddBatch, opt.checkBatch]):
+        factory.makeNominals()
 
     if opt.localCompile:
         subprocess.run(["make", "-j4"])

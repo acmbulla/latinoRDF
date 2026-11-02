@@ -139,6 +139,61 @@ class SnapshotFactory(AnalysisFactory):
         self._scripts_run_folder         = 'scripts_snapshot_run'
         self._script_batch_location      = './scripts_snapshot_batch/'
         self._metadata                   = None
+        self._skipShapeNuisances         = False
+        # set only while generating a varied job's .cpp (see makeShapeNuisances)
+        self._suffix_variation           = None
+
+    # _____________________________________________________________________________
+    def setSkipShapeNuisances(self, skip):
+        """Opt out of the shape-nuisance jobs even though nuisances.py declares them."""
+        self._skipShapeNuisances = bool(skip)
+
+    # _____________________________________________________________________________
+    def doShapeNuisances(self):
+        """Whether the varied trees are part of this run.
+
+        Derived from the configuration, not from a command-line flag: a
+        'suffix' nuisance left uncommented in nuisances.py IS the request. The
+        flag only existed because submitBatch could not see those jobs, and
+        having to repeat it on every step was a way to generate the varied
+        .cpp and then submit only the nominal ones -- a silent half-run.
+
+        setSkipShapeNuisances() is the escape hatch, for a quick nominal-only
+        snapshot without editing nuisances.py.
+        """
+        return bool(self._suffixNuisances()) and not self._skipShapeNuisances
+
+    # _____________________________________________________________________________
+    def _suffixNuisances(self):
+        """The shape nuisances that need a separate pass over a varied tree."""
+        return [(n, nu) for n, nu in self._nuisances.items()
+                if nu.get('type') == 'shape'
+                and nu.get('kind') in ('suffix', 'suffixFly')]
+
+    def _nuisance_names(self, nuisanceName, direction, sampleName, subname, i):
+        """(job_name, out_file) of one varied job -- the ONLY place they are spelled.
+
+        makeShapeNuisances, _batch_jobs_for_chunk and _output_file_from_suffix
+        all go through this, because the job name and the output name order
+        their fields differently (nuisance first in one, last in the other) and
+        hand-writing that twice is how checkBatch came to look for a file no
+        job ever wrote.
+        """
+        return (f"{self.job_prefix()}_{nuisanceName}{direction}_{sampleName}_{subname}_{i}",
+                f"nanoLatino_snapshot____{sampleName}_{subname}_{i}_{nuisanceName}{direction}.root")
+
+    # _____________________________________________________________________________
+    def _batch_jobs_for_chunk(self, sampleName, subname, i):
+        jobs = super()._batch_jobs_for_chunk(sampleName, subname, i)
+        if not self.doShapeNuisances():
+            return jobs
+        for nuisanceName, nuisance in self._suffixNuisances():
+            if sampleName not in nuisance.get('samples', {}):
+                continue
+            for direction in ('Up', 'Down'):
+                jobs.append(self._nuisance_names(nuisanceName, direction,
+                                                 sampleName, subname, i))
+        return jobs
 
     # _____________________________________________________________________________
     def setSnapshotValues(self, variables_to_dump, cut_to_dump, folder_where_to_save_trees):
@@ -157,6 +212,22 @@ class SnapshotFactory(AnalysisFactory):
         return f"nanoLatino_snapshot____{sampleName}_{subname}_{i}.root"
 
     def _output_file_from_suffix(self, sampleName, subname, suffix):
+        """The output file of the job whose name is job_prefix() + '_' + suffix.
+
+        checkBatch strips job_prefix() and hands us the rest, so for a nominal
+        job the suffix IS the output stem. For a varied one it is not: the job
+        name starts with <nuisance><Up|Down>_ while the file ends with it, so
+        the field has to be moved back. Without this every shape-nuisance job
+        was reported missing even after it had run.
+        """
+        for nuisanceName, _ in self._suffixNuisances():
+            for direction in ('Up', 'Down'):
+                head = f"{nuisanceName}{direction}_"
+                if suffix.startswith(head):
+                    stem = suffix[len(head):]
+                    return os.path.join(
+                        self._folder_where_to_save_trees,
+                        f"nanoLatino_snapshot____{stem}_{nuisanceName}{direction}.root")
         return os.path.join(self._folder_where_to_save_trees,
                             f"nanoLatino_snapshot____{suffix}.root")
 
@@ -213,17 +284,77 @@ class SnapshotFactory(AnalysisFactory):
                     and nuisance.get('kind') == 'weight'
                     and sampleName in nuisance.get('samples', {})):
                 samples_entry = nuisance['samples'][sampleName]
+                # Parenthesised for the same reason as in mkShapes.py: a
+                # factor that is not a primary expression, a ternary above
+                # all, rebinds around the product and drops the nominal
+                # weight.
                 if len(samples_entry) == 3:
                     if samples_entry[0] in weight:
-                        var_up = weight.replace(samples_entry[0], samples_entry[1])
-                        var_do = weight.replace(samples_entry[0], samples_entry[2])
+                        var_up = weight.replace(samples_entry[0], f"({samples_entry[1]})")
+                        var_do = weight.replace(samples_entry[0], f"({samples_entry[2]})")
                     else:
                         continue
                 else:
-                    var_up = f"({weight}) * {samples_entry[0]}"
-                    var_do = f"({weight}) * {samples_entry[1]}"
+                    var_up = f"({weight}) * ({samples_entry[0]})"
+                    var_do = f"({weight}) * ({samples_entry[1]})"
                 out += f'    varied_df = SafeDefine(varied_df, "my_sample_weight_{nuisanceName}Up",   "{var_up}");\n'
                 out += f'    varied_df = SafeDefine(varied_df, "my_sample_weight_{nuisanceName}Down", "{var_do}");\n'
+        return out
+
+    # _____________________________________________________________________________
+    #  Varied input — the nominal tree, with the suffix folder as a friend
+    # _____________________________________________________________________________
+
+    def _build_cpp_input_files_extra(self, tree_name, file_path, sampleName):
+        """Attach the variation's files as a friend of the nominal chain.
+
+        A '*_suffix' production is not a full nanoAOD: it holds only the
+        branches the variation touches, each named '<nominal branch>_<map>'.
+        Read on its own it defines almost nothing, so the first alias or cut
+        that mentions an ordinary branch dies in the JIT with 'use of
+        undeclared identifier Lepton_pt'. The varied job therefore reads the
+        nominal files and adds the varied ones as a friend, the way mkShapes
+        already does, and _build_cpp_after_df() swaps the columns over.
+        """
+        var = self._suffix_variation
+        if not var:
+            return ""
+        out  = "//  Variation input files (friend of the nominal chain)\n"
+        out += f'    auto* varied_friend = new TChain("{tree_name}");\n'
+        for file_name in var['files']:
+            out += f'    varied_friend->Add("{file_name}");\n'
+        out += f'    nominal->AddFriend(varied_friend, "{var["map"]}");\n'
+        out += '    auto nominalBranches = getBranchNames(nominal);\n'
+        out += '    auto variedBranches  = getBranchNames(varied_friend);\n'
+        out += '    \n'
+        return out
+
+    def _build_cpp_after_df(self, sampleName):
+        """Redefine every nominal column the variation provides.
+
+        Which columns those are is a property of the input files, not of the
+        configuration, so the list is walked on the node at runtime: every
+        friend branch ending in '_<map>' whose nominal counterpart exists is
+        redefined from it. Everything downstream -- aliases, variables, the
+        cut -- then sees varied values under the nominal names, which is what
+        makes the varied snapshot a drop-in friend for mkShapes
+        --fromSnapshot: it reads '<nuisance><Up|Down>.<nominal column>'.
+        """
+        var = self._suffix_variation
+        if not var:
+            return ""
+        out  = "\n//  Replace the nominal columns with their varied counterparts\n"
+        out += f'    const std::string varied_suffix = "_{var["map"]}";\n'
+        out += '    for (const auto& branch : variedBranches) {\n'
+        out += '      if (branch.size() <= varied_suffix.size()) continue;\n'
+        out += '      if (branch.compare(branch.size() - varied_suffix.size(),\n'
+        out += '                         varied_suffix.size(), varied_suffix) != 0) continue;\n'
+        out += '      const std::string nomCol = branch.substr(0, branch.size() - varied_suffix.size());\n'
+        out += '      if (std::find(nominalBranches.begin(), nominalBranches.end(), nomCol)\n'
+        out += '          == nominalBranches.end()) continue;\n'
+        out += '      varied_df = varied_df.Redefine(nomCol, branch);\n'
+        out += '    }\n'
+        out += '    \n'
         return out
 
     # _____________________________________________________________________________
@@ -279,7 +410,14 @@ class SnapshotFactory(AnalysisFactory):
         frags = self._build_cpp_common(tree_name, file_path, sampleName, weight,
                                        aliases_ordered or {}, range_start, range_end)
 
-        mt_setting = "ROOT::DisableImplicitMT();" if (range_start is not None and range_end is not None) else "ROOT::EnableImplicitMT();"
+        # A Range() is single-thread by construction. A varied job is run
+        # single-thread too: its input is the nominal chain with a friend
+        # chain attached, and entry-by-entry alignment between the two is
+        # what makes the variation correct -- not worth risking for threads
+        # the batch node does not give us anyway (condor allots 1 CPU).
+        single_thread = ((range_start is not None and range_end is not None)
+                         or self._suffix_variation is not None)
+        mt_setting = "ROOT::DisableImplicitMT();" if single_thread else "ROOT::EnableImplicitMT();"
 
         snapshot_call = f'node_{self._cut_to_dump}.Snapshot("Events", "{output_root_file_name}", columns_to_save);\n'
 
@@ -291,6 +429,9 @@ class SnapshotFactory(AnalysisFactory):
 #include "TH1D.h"
 #include "TDirectory.h"
 #include "TChain.h"
+#include "TTree.h"
+#include "TObjArray.h"
+#include <algorithm>
 #include <map>
 #include <vector>
 #include <iostream>
@@ -306,6 +447,15 @@ ROOT::RDF::RNode SafeDefine(ROOT::RDF::RNode df, std::string name, std::string e
     return df;
 }}
 
+std::vector<std::string> getBranchNames(TTree* tree) {{
+    std::vector<std::string> names;
+    TObjArray* branches = tree->GetListOfBranches();
+    if (!branches) return names;
+    for (int i = 0; i < branches->GetEntries(); ++i)
+        names.push_back(branches->At(i)->GetName());
+    return names;
+}}
+
 {frags['lines_to_add']}
 
 {frags['code_of_function_to_include']}
@@ -314,8 +464,6 @@ ROOT::RDF::RNode SafeDefine(ROOT::RDF::RNode df, std::string name, std::string e
 
 int main() {{
     {mt_setting}
-
-    {frags['lines_to_process']}
 
     {frags['define_input_files_logic']}
 
@@ -335,8 +483,7 @@ int main() {{
     return 0;
 }}
 """
-        with open(f"{output_name}.cpp", "w") as f:
-            f.write(cpp_code)
+        self._write_if_changed(f"{output_name}.cpp", cpp_code)
 
     # _____________________________________________________________________________
     #  generate_makefile (standalone — no liblibrary_utils)
@@ -469,6 +616,12 @@ int main() {{
         print(f"  -> Metadata saved: {self._metadata._path}")
 
         self.generate_makefile(list_of_files_to_compile)
+
+        # The varied trees belong to the same run, so generate them here rather
+        # than behind a flag -- otherwise submitBatch queues jobs whose .cpp
+        # does not exist.
+        if self.doShapeNuisances() and not patch_mode:
+            self.makeShapeNuisances()
         subprocess.run(["make", "-f", "MakefileSnapshot", "clean"])
         print("Scripts generated. To compile: make -f MakefileSnapshot -j8")
         print("Or use --localCompile.")
@@ -523,16 +676,14 @@ int main() {{
                             map_name = nuisance[f'map{direction}']
                             folder   = nuisance[f'folder{direction}']
 
-                            # build alternative file list
-                            alt_files = []
-                            for f_path in chunk['files']:
-                                fname = os.path.basename(f_path)
-                                alt_files.append(os.path.join(folder, fname))
+                            # the varied files are a friend of the nominal ones,
+                            # not a replacement for them: see
+                            # _build_cpp_input_files_extra
+                            varied_files = [os.path.join(folder, os.path.basename(f))
+                                            for f in chunk['files']]
 
-                            job_name  = (f"my_snapshot_{nuisanceName}{direction}_"
-                                         f"{sampleName}_{subname}_{i}")
-                            out_file  = (f"nanoLatino_snapshot____{sampleName}_{subname}_{i}"
-                                         f"_{nuisanceName}{direction}.root")
+                            job_name, out_file = self._nuisance_names(
+                                nuisanceName, direction, sampleName, subname, i)
                             name_code = os.path.join(self._scripts_run_folder, sampleName,
                                                      subname, job_name)
 
@@ -541,12 +692,21 @@ int main() {{
                             weight = (f"({global_weight}) * ({weights_subname[subname]})"
                                       if subname in weights_subname else global_weight)
 
-                            self.create_cpp_source_list_of_files(
-                                name_code, "Events", alt_files, out_file,
-                                sampleName, weight,
-                                {}, {}, aliases_ordered=aliases_ordered,
-                                range_start=chunk.get('range_start'),
-                                range_end=chunk.get('range_end'))
+                            self._suffix_variation = {
+                                'nuisance' : nuisanceName,
+                                'direction': direction,
+                                'map'      : map_name,
+                                'files'    : varied_files,
+                            }
+                            try:
+                                self.create_cpp_source_list_of_files(
+                                    name_code, "Events", chunk['files'], out_file,
+                                    sampleName, weight,
+                                    {}, {}, aliases_ordered=aliases_ordered,
+                                    range_start=chunk.get('range_start'),
+                                    range_end=chunk.get('range_end'))
+                            finally:
+                                self._suffix_variation = None
 
                             list_of_files_to_compile.append(name_code + ".cpp")
 
@@ -579,8 +739,8 @@ int main() {{
     #  submitBatch hooks
     # _____________________________________________________________________________
 
-    def _extra_transfer_files_for_submit(self, precompiled, x509_proxy, extra_files_str):
-        return f"{x509_proxy}{extra_files_str}"
+    def _extra_transfer_files_for_submit(self, precompiled, credentials, extra_files_str):
+        return f"{credentials}{extra_files_str}"
 
     def _build_bash_precompiled(self, job_name, out_file, sampleName, subname,
                                 proxy_lines, submission_dir, root_cflags, root_libs):
@@ -620,10 +780,6 @@ echo "Done at $(date)"; ls -lh
     #  checkBatch — output file is in folder_where_to_save_trees, not outputDir
     # _____________________________________________________________________________
 
-    def _output_file_from_suffix(self, sampleName, subname, suffix):
-        return os.path.join(self._folder_where_to_save_trees,
-                            f"nanoLatino_snapshot____{suffix}.root")
-
     def checkBatch(self, resubmit=False):
         """Override to also mark completed jobs in metadata."""
         super().checkBatch(resubmit=resubmit)
@@ -640,8 +796,7 @@ echo "Done at $(date)"; ls -lh
                 for sh_file in sh_files:
                     job_name = sh_file[:-3]
                     suffix   = job_name.replace(self.job_prefix() + "_", "", 1)
-                    out_path = os.path.join(self._folder_where_to_save_trees,
-                                            f"nanoLatino_snapshot____{suffix}.root")
+                    out_path = self._output_file_from_suffix(sampleName, subname, suffix)
                     job_key  = suffix
                     if os.path.exists(out_path):
                         self._metadata.mark_completed(job_key, out_path)
@@ -676,7 +831,12 @@ if __name__ == '__main__':
     parser.add_argument("--patch",           action='store_true', dest="patch",
                         help="Add missing variables to existing snapshots")
     parser.add_argument("--shapeNuisances",  action='store_true', dest="shapeNuisances",
-                        help="Generate alternative TTree files for shape nuisances")
+                        help="No longer needed: the varied trees are produced "
+                             "whenever nuisances.py declares a 'suffix' nuisance. "
+                             "Accepted and ignored.")
+    parser.add_argument("--noShapeNuisances", action='store_true', dest="noShapeNuisances",
+                        help="Nominal snapshot only, ignoring the 'suffix' "
+                             "nuisances declared in nuisances.py")
     parser.add_argument("--force",           action='store_true', dest="force",
                         help="Force regeneration even if already done")
 
@@ -717,19 +877,34 @@ if __name__ == '__main__':
     factory.setSnapshotValues(variables_to_dump, cut_to_dump, folder_where_to_save_trees)
     factory.setConditions(opt.silentMode)
 
-    if not any([opt.submitBatch, opt.checkBatch, opt.localCompile,
-                opt.patch, opt.shapeNuisances, opt.haddBatch]):
-        factory.makeScripts(force=opt.force)
+    factory.setSkipShapeNuisances(opt.noShapeNuisances)
+    if opt.shapeNuisances:
+        print("  NOTE: --shapeNuisances is no longer needed; the varied trees are\n"
+              "        produced whenever nuisances.py declares a 'suffix' nuisance.\n"
+              "        Use --noShapeNuisances to opt out.")
 
+    n_suffix = len(factory._suffixNuisances())
+    if n_suffix:
+        if factory.doShapeNuisances():
+            print(f"  -> {n_suffix} shape nuisance(s): {2 * n_suffix} varied tree(s) per job.")
+        else:
+            print(f"  -> {n_suffix} shape nuisance(s) declared, skipped (--noShapeNuisances).")
+
+    # Generating the scripts is the prerequisite of compiling and of submitting,
+    # and it is cheap and idempotent (_write_if_changed), so it runs for those
+    # too. It used to be a separate bare invocation, so --submitBatch on a clean
+    # job directory queued jobs whose .cpp did not exist.
+    # --checkBatch and --haddBatch only read what is already there.
     if opt.patch:
         factory.makeScripts(patch_mode=True, force=opt.force)
-
-    if opt.shapeNuisances:
-        factory.makeShapeNuisances()
+    elif not any([opt.checkBatch, opt.haddBatch]):
+        factory.makeScripts(force=opt.force)
 
     if opt.localCompile:
-        factory.makeScripts(force=opt.force)
         subprocess.run(["make", "-f", "MakefileSnapshot", "-j8"])
+        # makeScripts wrote this one too, so build it in the same breath
+        if factory.doShapeNuisances():
+            subprocess.run(["make", "-f", "MakefileSnapshotNuisances", "-j8"])
 
     if opt.submitBatch:
         factory.submitBatch()
