@@ -820,6 +820,11 @@ class AnalysisFactory:
         through a CMS redirector (root://xrootd-cms..., cms-xrd-global), which
         only accepts GSI. So a missing proxy is a warning, not an error, and the
         job fails later with a clear xrootd message if the inputs do need one.
+
+        A staticmethod because mkMergeYears submits from a module-level
+        function rather than from an AnalysisFactory, and its jobs need the
+        same credentials for the same reason: they xrdcp each year's file off
+        EOS.
         """
         _proxy_candidates = [
             os.environ.get('X509_USER_PROXY', ''),
