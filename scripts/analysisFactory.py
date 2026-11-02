@@ -802,7 +802,8 @@ class AnalysisFactory:
         """
         return ", ".join(f.strip() for f in files_str.split(',') if f.strip())
 
-    def _check_proxy(self):
+    @staticmethod
+    def _check_proxy():
         """Locate an X509 proxy. Returns ("", lines) when there is none.
 
         A proxy is *not* required to reach CERN EOS: xrdcp to eosuser/eoscms
@@ -846,7 +847,8 @@ class AnalysisFactory:
         print("           will fail on the node: voms-proxy-init --voms cms --valid 168:00")
         return "", (f"export EOS_MGM_URL=root://eosuser.cern.ch\n")
 
-    def _check_kerberos(self):
+    @staticmethod
+    def _check_kerberos():
         """Locate a Kerberos credential cache. Returns ("", "") when there is none.
 
         Why this is shipped rather than read from /tmp on the node: the
@@ -910,16 +912,22 @@ class AnalysisFactory:
                        f"chmod 600 $(pwd)/{basename} 2>/dev/null || true\n"
                        f"klist 2>/dev/null || true\n")
 
-    def _check_credentials(self):
+    @staticmethod
+    def _check_credentials():
         """The credential files to ship, and the lines that point the job at them.
 
         Both are optional and independent: a grid proxy, a Kerberos ticket,
         either, or neither. Whatever is there is shipped, nothing is required,
         and the job fails later with xrootd's own message if it needed what was
         missing.
+
+        A staticmethod because mkMergeYears submits from a module-level
+        function rather than from an AnalysisFactory, and needs the same
+        credentials for the same reason: its jobs xrdcp each year's file off
+        EOS.
         """
-        x509_proxy, proxy_lines = self._check_proxy()
-        krb_cache,  krb_lines   = self._check_kerberos()
+        x509_proxy, proxy_lines = AnalysisFactory._check_proxy()
+        krb_cache,  krb_lines   = AnalysisFactory._check_kerberos()
         credentials = ", ".join(p for p in (x509_proxy, krb_cache) if p)
         return credentials, krb_lines + proxy_lines
 

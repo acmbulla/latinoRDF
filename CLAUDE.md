@@ -233,7 +233,10 @@ Notes:
   `export KRB5CCNAME=FILE:$(pwd)/<basename>`. Nothing is required: proxy,
   ticket, either, or neither, and the job fails later with xrootd's own
   message if it needed what was missing. `_check_credentials()` is the one
-  place both are assembled.
+  place both are assembled, and it is a `staticmethod` so that
+  `mkMergeYears.submitBatch` — a module-level function, not an
+  `AnalysisFactory` — ships the same credentials. Its jobs `xrdcp` every
+  year's file off EOS, so they need them for exactly the same reason.
 
   Three things about it:
 
