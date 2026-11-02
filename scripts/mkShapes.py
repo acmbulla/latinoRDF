@@ -613,7 +613,7 @@ int main() {{
                     out_file  = self.output_file_name(sampleName, subname, i)
 
                     self.create_cpp_source_list_of_files(
-                        name_code, "Events", chunk['files'], out_file, sampleName, weight,
+                        name_code, self._treeName, chunk['files'], out_file, sampleName, weight,
                         {}, {}, subsamples_dict, aliases_ordered,
                         range_start=chunk['range_start'], range_end=chunk['range_end'])
 
@@ -748,7 +748,7 @@ int main() {{
                 out_file  = self.output_file_name(sampleName, subname, i)
 
                 self.create_cpp_source_list_of_files_from_snapshot(
-                    name_code, "Events",
+                    name_code, self._treeName,
                     nominal_files   = chunk_files,
                     patch_files     = all_patch_files,
                     shape_friends   = shape_friends,
@@ -889,7 +889,7 @@ int main() {{
                 out_file  = self.output_file_name(sampleName, subname, i)
 
                 self.create_cpp_source_list_of_files_from_snapshot(
-                    name_code, "Events",
+                    name_code, self._treeName,
                     nominal_file    = snap_file,
                     patch_files     = patch_files,
                     shape_friends   = shape_friends,

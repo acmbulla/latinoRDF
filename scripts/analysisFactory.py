@@ -179,6 +179,13 @@ class AnalysisFactory:
         self._scripts_run_folder    = 'scripts_run'
         self._silentMode = False
         self._extra_transfer_files  = []
+        # The name of the input TTree, in one place. Everything that opens an
+        # input file -- the generated C++, the friend chains, the event
+        # counting -- reads it from here instead of repeating the literal, so
+        # pointing the framework at a differently named tree is one
+        # assignment. It is not a configuration key yet; when it becomes one,
+        # this is the line that reads it.
+        self._treeName = 'Events'
         self._jobs_config = self._resolve_jobs_config()
 
     def __del__(self):
@@ -314,7 +321,7 @@ class AnalysisFactory:
     # _____________________________________________________________________________
 
     @staticmethod
-    def _get_nevents(file_path, tree_name="Events"):
+    def _get_nevents(file_path, tree_name):
         try:
             f = ROOT.TFile.Open(file_path)
             if not f or f.IsZombie():
@@ -363,7 +370,8 @@ class AnalysisFactory:
         with open(cache_path, 'w') as f:
             json.dump(cache, f, indent=2)
 
-    def _count_events(self, all_files, tree_name="Events", n_workers=8):
+    def _count_events(self, all_files, tree_name=None, n_workers=8):
+        tree_name = tree_name or self._treeName
         import multiprocessing
         cache, cache_path = self._load_events_cache()
         results  = {}
@@ -475,7 +483,7 @@ class AnalysisFactory:
         for f in sorted_files:
             n = nevents_map.get(f, 0)
             if n == 0:
-                n = self._get_nevents(f)
+                n = self._get_nevents(f, self._treeName)
                 nevents_map[f] = n
             file_nevents.append(n)
 
@@ -543,7 +551,7 @@ class AnalysisFactory:
                 pos = stop
         return capped
 
-    def _get_chunks(self, sample, list_root_files, tree="Events"):
+    def _get_chunks(self, sample, list_root_files):
         """Return chunks for a sample, using split/era, MaxEventsPerJob or FilesPerJob."""
         # an era split takes priority, and applies MaxEventsPerJob within the era
         era_chunks = self._apply_era_split(list_root_files, sample)
