@@ -4,6 +4,7 @@ import sys
 import os
 import logging
 import subprocess
+import shutil
 
 import ROOT
 
@@ -782,7 +783,7 @@ class AnalysisFactory:
         return ", ".join(f.strip() for f in files_str.split(',') if f.strip())
 
     @staticmethod
-    def _check_proxy():
+    def _check_proxy(stage_dir):
         """Locate an X509 proxy. Returns ("", lines) when there is none.
 
         A proxy is *not* required to reach CERN EOS: xrdcp to eosuser/eoscms
@@ -815,12 +816,17 @@ class AnalysisFactory:
                 print("  -> voms-proxy-info not found, not checking the proxy validity.")
 
         if x509_proxy and valid:
-            proxy_basename = os.path.basename(x509_proxy)
+            print(f"  -> X509 proxy found and valid: {x509_proxy}")
+            staged = AnalysisFactory._stage_credential(x509_proxy, stage_dir,
+                                                       "x509up_staged")
+            if not staged:
+                return "", (f"export EOS_MGM_URL=root://eosuser.cern.ch\n")
+            proxy_basename = os.path.basename(staged)
             proxy_lines = (f"export X509_USER_PROXY=$(pwd)/{proxy_basename}\n"
                            f"export EOS_MGM_URL=root://eosuser.cern.ch\n"
                            f"voms-proxy-info\n")
-            print(f"  -> X509 proxy found and valid: {x509_proxy}")
-            return x509_proxy, proxy_lines
+            print(f"     Staged for the access point at {staged}")
+            return staged, proxy_lines
 
         if x509_proxy:
             print(f"  WARNING: proxy found at {x509_proxy} but it is expired or invalid.")
@@ -832,7 +838,62 @@ class AnalysisFactory:
         return "", (f"export EOS_MGM_URL=root://eosuser.cern.ch\n")
 
     @staticmethod
-    def _check_kerberos():
+    def _stage_credential(path, stage_dir, name):
+        """Copy a credential into the submit directory and return the copy's path.
+
+        WHY THIS EXISTS. `transfer_input_files` is read by the shadow on the
+        ACCESS POINT, not by the shell that ran condor_submit, and at CERN
+        those are different machines: you submit from lxplus, the schedd lives
+        on bigbird. A path that exists only on the submitting node is therefore
+        invisible to the transfer and the job is held:
+
+          Hold reason: Transfer input files failure at access point bigbird14
+          ... reading from file /run/user/148186/krb5cc: (errno 2) No such
+          file or directory
+
+        `/run/user/<uid>` is a per-user tmpfs, local to that one lxplus node --
+        the modern default for a Kerberos cache, and never reachable from the
+        AP. `/tmp/x509up_u<uid>`, the usual proxy location, has exactly the
+        same problem; `~/.proxy` happens to work only because AFS is shared.
+
+        So the original is not what gets shipped. It is copied into the submit
+        directory, which the AP demonstrably reads -- every .cpp and binary in
+        `transfer_input_files` comes from there, and the hold above reported
+        `1 total failures`, i.e. only the credential -- and the copy is what
+        goes in the list. That directory is on AFS or EOS, so whatever reaches
+        the transfer reaches it.
+
+        SECURITY, because this writes a live credential to shared storage. The
+        copy is created 0600 and nothing deletes it: a valid ticket or proxy
+        sits in the submit directory until it expires. That is a real exposure,
+        though HTCondor already sends the same bytes to every execute node.
+        Deleting the `*_staged` files once the cluster has matched is safe --
+        the transfer happens at match time, not later.
+
+        It does not fix expiry. A ticket is good for about ten hours, so a job
+        that starts after that, or a `--resubmit` the next day, ships a dead
+        one. The schedd's own credential store
+        (`MY.SendCredential = True` plus SEC_CREDENTIAL_PRODUCER) is the route
+        that renews; this is the cheap one, and it is the one in use.
+
+        Returns "" when the copy cannot be made, so submission continues
+        without that credential, like every other failure path here.
+        """
+        try:
+            os.makedirs(stage_dir, exist_ok=True)
+            staged = os.path.join(stage_dir, name)
+            # copyfile, not copy2: the mode is set below and deliberately not
+            # inherited from a source that may be group readable.
+            shutil.copyfile(path, staged)
+            os.chmod(staged, 0o600)
+            return staged
+        except OSError as e:
+            print(f"  WARNING: could not stage {path} into {stage_dir}: {e}")
+            print( "           Submitting without it.")
+            return ""
+
+    @staticmethod
+    def _check_kerberos(stage_dir):
         """Locate a Kerberos credential cache. Returns ("", "") when there is none.
 
         Why this is shipped rather than read from /tmp on the node: the
@@ -840,7 +901,8 @@ class AnalysisFactory:
         node's. A job that reads /tmp/krb5cc_<uid> there finds either nothing
         or, on a shared pool, somebody else's file. So the cache travels in
         transfer_input_files like the proxy does, and the wrapper points
-        KRB5CCNAME at the sandbox copy.
+        KRB5CCNAME at the sandbox copy. What travels is a copy made in the
+        submit directory, not the cache itself -- see `_stage_credential`.
 
         That export is not cosmetic. The submit file sets `getenv = True`, so
         the job inherits KRB5CCNAME from the submitting shell -- a path that
@@ -888,17 +950,25 @@ class AnalysisFactory:
             print( "           job writes to EOS over Kerberos rather than with a proxy.")
             return "", ""
 
-        basename = os.path.basename(cache)
         print(f"  -> Kerberos ticket found and valid: {cache}")
+        staged = AnalysisFactory._stage_credential(cache, stage_dir, "krb5cc_staged")
+        if not staged:
+            return "", ""
+        basename = os.path.basename(staged)
+        print(f"     Staged for the access point at {staged}")
         print( "     Shipped with the job. It expires in hours, not days, so a job")
         print( "     that starts much later will not have it.")
-        return cache, (f"export KRB5CCNAME=FILE:$(pwd)/{basename}\n"
-                       f"chmod 600 $(pwd)/{basename} 2>/dev/null || true\n"
-                       f"klist 2>/dev/null || true\n")
+        return staged, (f"export KRB5CCNAME=FILE:$(pwd)/{basename}\n"
+                        f"chmod 600 $(pwd)/{basename} 2>/dev/null || true\n"
+                        f"klist 2>/dev/null || true\n")
 
     @staticmethod
-    def _check_credentials():
+    def _check_credentials(stage_dir):
         """The credential files to ship, and the lines that point the job at them.
+
+        `stage_dir` is where the copies go -- the submit directory, which the
+        access point can read. Shipping the originals does not work; see
+        `_stage_credential` for the hold message that produces.
 
         Both are optional and independent: a grid proxy, a Kerberos ticket,
         either, or neither. Whatever is there is shipped, nothing is required,
@@ -910,11 +980,10 @@ class AnalysisFactory:
         credentials for the same reason: its jobs xrdcp each year's file off
         EOS.
         """
-        x509_proxy, proxy_lines = AnalysisFactory._check_proxy()
-        krb_cache,  krb_lines   = AnalysisFactory._check_kerberos()
+        x509_proxy, proxy_lines = AnalysisFactory._check_proxy(stage_dir)
+        krb_cache,  krb_lines   = AnalysisFactory._check_kerberos(stage_dir)
         credentials = ", ".join(p for p in (x509_proxy, krb_cache) if p)
         return credentials, krb_lines + proxy_lines
-
 
     # _____________________________________________________________________________
     #  submitBatch — shared skeleton
@@ -939,7 +1008,7 @@ class AnalysisFactory:
         precompiled = self._detect_precompiled()
         print(f"  -> {'Pre-compiled' if precompiled else 'Compile-on-node'} mode.")
 
-        credentials, proxy_lines = self._check_credentials()
+        credentials, proxy_lines = self._check_credentials(self._script_batch_location)
 
         self._pre_count_events()
 
@@ -1267,7 +1336,7 @@ class AnalysisFactory:
             return
         print(f"  -> All jobs done, proceeding with hadd ({len(missing)} missing = 0)")
 
-        credentials, proxy_lines = self._check_credentials()
+        credentials, proxy_lines = self._check_credentials(self._script_batch_location)
 
         # resolve absolute output_dir
         if not os.path.isabs(output_dir):
