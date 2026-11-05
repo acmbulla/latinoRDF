@@ -193,9 +193,14 @@ def submitBatch(pycfg, outputDir, cutNames, batchDir="jobsMerge", jobFlavour="to
     # the same credentials as the mkShapes and mkSnapshot jobs. Both are
     # optional and neither is required; whatever exists is shipped. Without
     # this the submit file's `getenv = True` leaves KRB5CCNAME pointing at the
-    # submit node's /tmp, which does not exist on the execute node, and the
+    # submit node's cache, which does not exist on the execute node, and the
     # copy fails there with an xrootd authentication error.
-    credentials, cred_lines = AnalysisFactory._check_credentials()
+    #
+    # batchDir is both where the .sub is written and where the credential
+    # copies go: the access point reads transfer_input_files from its own
+    # filesystem, so the original path is not shippable. See
+    # AnalysisFactory._stage_credential.
+    credentials, cred_lines = AnalysisFactory._check_credentials(batchDir)
 
     sh_path = os.path.join(batchDir, "merge_one_cut.sh")
     with open(sh_path, "w") as f:
